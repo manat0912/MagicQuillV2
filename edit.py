@@ -279,6 +279,26 @@ class KontextEditModel():
     def _pil_to_tensor(self, pil_image):
         return torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0).unsqueeze(0)
 
+    def _debug_dump(self, name, tensor):
+        # Save a tensor (mask or image) to ./debug_masks for inspection.
+        # Enabled only when MAGICQUILL_DEBUG_MASKS is set, so normal runs are unaffected.
+        if not os.environ.get("MAGICQUILL_DEBUG_MASKS"):
+            return
+        try:
+            out_dir = os.environ.get("MAGICQUILL_DEBUG_DIR", "debug_masks")
+            os.makedirs(out_dir, exist_ok=True)
+            arr = tensor.detach().float().cpu().numpy()
+            arr = np.squeeze(arr)
+            if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+                arr = np.transpose(arr, (1, 2, 0))
+            arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+            Image.fromarray(arr).save(os.path.join(out_dir, f"{name}.png"))
+            lo, hi = float(tensor.min()), float(tensor.max())
+            frac_lt = float((tensor < 0.5).float().mean())
+            print(f"[DEBUG] dumped {name}: shape={tuple(tensor.shape)} min={lo:.3f} max={hi:.3f} frac(<0.5)={frac_lt:.3f}")
+        except Exception as e:
+            print(f"[DEBUG] failed to dump {name}: {e}")
+
     def _ensure_channels_last(self, image_tensor: torch.Tensor, name: str = "image") -> torch.Tensor:
         # Normalize image tensors to (1, H, W, C) for all blend operations.
         if image_tensor.ndim != 4:
@@ -619,6 +639,12 @@ class KontextEditModel():
         fill_hi = (fill_mask < 0.5).float()
         has_fill_stroke = torch.sum(fill_hi > 0.5).item() > 0
 
+        self._debug_dump("01_add_prop_mask", add_prop_mask)
+        self._debug_dump("02_fill_mask", fill_mask)
+        self._debug_dump("03_total_mask", total_mask)
+        self._debug_dump("04_prop_hi", prop_hi)
+        self._debug_dump("05_merged_input", merged_original)
+
         if has_fill_stroke:
             # Magic-quill fill brush: only regenerate the brushed fill region.
             edit_mask = self._expand_mask(fill_hi, expand=25)
@@ -634,6 +660,10 @@ class KontextEditModel():
             white_region = white_region.squeeze(0)
         white_3 = white_region.unsqueeze(-1).expand(-1, -1, img.shape[-1])
         img[0] = torch.where(white_3, torch.ones_like(img[0]), img[0])
+
+        self._debug_dump("06_edit_mask", edit_mask)
+        self._debug_dump("07_white_region", white_region.float())
+        self._debug_dump("08_whited_input", img)
 
         image_pil = self._tensor_to_pil(img)
 
