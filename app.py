@@ -76,14 +76,34 @@ def generate(merged_image, total_mask, original_image, add_color_image, add_edge
     add_prop_mask = create_alpha_mask(read_base64_image_utils(add_prop_image)) if add_prop_image else torch.ones_like(total_mask_tensor)
     fill_mask_tensor = create_alpha_mask(read_base64_image_utils(fill_mask)) if fill_mask else torch.ones_like(total_mask_tensor)
 
+    # Some UI flows record magic-quill strokes only on total_mask (not add_edge_mask).
+    extra_active = torch.clamp((total_mask_tensor < 0.5).float() - (add_prop_mask < 0.5).float(), 0.0, 1.0)
+    if torch.sum(extra_active > 0.5).item() > 0:
+        add_mask = torch.minimum(add_mask, 1.0 - extra_active)
+
+    has_prop = torch.sum(add_prop_mask < 0.5).item() > 0
+    has_brush = torch.sum(add_mask < 0.5).item() > 0 or torch.sum(remove_mask < 0.5).item() > 0
+    has_fill = torch.sum(fill_mask_tensor < 0.5).item() > 0
+
+    edit_image_tensor = original_image_tensor
+
     # Determine flag and modify prompt
     flag = "kontext"
-    if torch.sum(add_prop_mask < 0.5).item() > 0:
+    if has_brush:
+        # Magic-quill edge brush: use precise edit with edge/color controls.
+        flag = "precise_edit"
+        if has_prop:
+            edit_image_tensor = merged_image_tensor
+            # Keep edge control for matte+brush edits; background-only color layer confuses color LoRA.
+            add_color_image_tensor = merged_image_tensor
+    elif has_fill:
+        # Fill brush (checkered inpaint region): local edit on merged canvas when mattes exist.
+        flag = "local"
+        if has_prop:
+            edit_image_tensor = merged_image_tensor
+    elif has_prop:
         flag = "foreground"
         # Note: foreground_edit builds its own prompt internally
-
-    elif torch.sum(fill_mask_tensor < 0.5).item() > 0:
-        flag = "local"
     elif (torch.sum(remove_mask < 0.5).item() > 0 and torch.sum(add_mask < 0.5).item() == 0):
         positive_prompt = "remove the instance"
         flag = "removal"
@@ -92,9 +112,16 @@ def generate(merged_image, total_mask, original_image, add_color_image, add_edge
     
     print("positive prompt: ", positive_prompt)
     print("current flag: ", flag)
+    print(
+        "mask stats:",
+        f"prop={torch.sum(add_prop_mask < 0.5).item()}",
+        f"brush={torch.sum(add_mask < 0.5).item()}",
+        f"fill={torch.sum(fill_mask_tensor < 0.5).item()}",
+        f"extra={torch.sum(extra_active > 0.5).item()}",
+    )
 
     final_image, condition, mask = kontext_model.process(
-        original_image_tensor,
+        edit_image_tensor,
         add_color_image_tensor,
         merged_image_tensor,
         positive_prompt,
