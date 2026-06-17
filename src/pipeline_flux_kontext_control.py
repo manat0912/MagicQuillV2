@@ -317,6 +317,15 @@ class FluxKontextControlPipeline(
             first_param = next(self.transformer.parameters())
             target_device = first_param.device
             target_dtype = first_param.dtype
+            # The base transformer may be quantized (GGUF -> uint8, or fp8); LoRA
+            # layers are trainable nn.Linear params and must be a real floating
+            # point dtype, so fall back to bf16 like prepare_lora_processors does.
+            if (
+                str(target_dtype).endswith("float8_e4m3fn")
+                or str(target_dtype).endswith("float8_e5m2")
+                or not target_dtype.is_floating_point
+            ):
+                target_dtype = torch.bfloat16
         except StopIteration:
             target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             target_dtype = torch.float32
@@ -402,6 +411,15 @@ class FluxKontextControlPipeline(
             first_param = next(self.transformer.parameters())
             device = first_param.device
             dtype = first_param.dtype
+            # A quantized base (GGUF uint8 / fp8) must not be used as the gamma
+            # dtype: e.g. torch.tensor([0.5], dtype=uint8) -> 0, which silently
+            # zeroes the control strength. Use a real float dtype instead.
+            if (
+                str(dtype).endswith("float8_e4m3fn")
+                or str(dtype).endswith("float8_e5m2")
+                or not dtype.is_floating_point
+            ):
+                dtype = torch.bfloat16
         except StopIteration:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             dtype = torch.float32
