@@ -282,7 +282,8 @@ class KontextEditModel():
     def _debug_dump(self, name, tensor):
         # Save a tensor (mask or image) to ./debug_masks for inspection.
         # Enabled only when MAGICQUILL_DEBUG_MASKS is set, so normal runs are unaffected.
-        if not os.environ.get("MAGICQUILL_DEBUG_MASKS"):
+        # Always-on for diagnostic run. Set MAGICQUILL_DEBUG_MASKS=0 to disable.
+        if os.environ.get("MAGICQUILL_DEBUG_MASKS", "1") == "0":
             return
         try:
             out_dir = os.environ.get("MAGICQUILL_DEBUG_DIR", "debug_masks")
