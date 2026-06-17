@@ -268,6 +268,42 @@ class KontextEditModel():
     def _pil_to_tensor(self, pil_image):
         return torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0).unsqueeze(0)
 
+    def _ensure_channels_last(self, image_tensor: torch.Tensor, name: str = "image") -> torch.Tensor:
+        # Normalize image tensors to (1, H, W, C) for all blend operations.
+        if image_tensor.ndim != 4:
+            raise ValueError(f"{name} must be 4D, got shape {tuple(image_tensor.shape)}")
+        if image_tensor.shape[-1] in [1, 3, 4]:
+            return image_tensor
+        if image_tensor.shape[1] in [1, 3, 4]:
+            return image_tensor.permute(0, 2, 3, 1).contiguous()
+        raise ValueError(f"{name} has unsupported channel layout: {tuple(image_tensor.shape)}")
+
+    def _mask_to_blend_tensor(self, mask_tensor: torch.Tensor, blur: bool = True) -> torch.Tensor:
+        # Convert any mask layout to channels-last blend weights (1, H, W, 1).
+        mask = mask_tensor.detach().float()
+        if mask.ndim == 4:
+            mask = mask[0, 0] if mask.shape[1] == 1 else mask[0].max(dim=0).values
+        elif mask.ndim == 3:
+            mask = mask[0]
+        mask_np = (mask.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
+        if blur:
+            mask_np = cv2.GaussianBlur(mask_np, (11, 11), 3.0)
+        return torch.from_numpy(mask_np / 255.0).float().unsqueeze(0).unsqueeze(-1)
+
+    def _composite_preserve_mask(self, final_image, original_image, preserve_mask, label="regions"):
+        if preserve_mask is None:
+            return final_image
+        if torch.sum(preserve_mask > 0.5).item() == 0:
+            return final_image
+        try:
+            blend = self._mask_to_blend_tensor(preserve_mask)
+            original_blend = self._ensure_channels_last(original_image, "original_image")
+            final_image = self._ensure_channels_last(final_image, "final_image")
+            return final_image * (1.0 - blend) + original_blend * blend
+        except Exception as e:
+            print(f"[WARN] Preserve composite failed ({label}): {e}")
+            return final_image
+
     def clear_cache(self):
         for name, attn_processor in self.pipe.transformer.attn_processors.items():
             if hasattr(attn_processor, 'bank_kv'):
@@ -326,15 +362,51 @@ class KontextEditModel():
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         original_image_tensor = image.clone()
-        # base_mask (total_mask) marks the user-edited region; strokes are LOW (<0.5).
-        original_mask = self._expand_mask((base_mask < 0.5).float(), expand=25)
+        
+        # CRITICAL FIX: Preserve matted objects when painting with brush
+        # base_mask (total_mask) may contain BOTH matted objects AND brush strokes
+        # add_mask, remove_mask are the paint brush stroke regions (LOW = stroke)
+        # We need to:
+        # 1. Extract ONLY the brush stroke regions (not entire base_mask)
+        # 2. Preserve matted objects outside brush regions
+        # 3. Regenerate only the brush stroke areas
+        
+        # Identify brush stroke regions (where add_mask or remove_mask have strokes)
+        has_add_stroke = torch.sum(add_mask < 0.5).item() > 0
+        has_remove_stroke = torch.sum(remove_mask < 0.5).item() > 0
+        
+        if has_add_stroke or has_remove_stroke:
+            # Brush strokes exist: create a mask for ONLY brush stroke regions
+            # Exclude the base_mask (matted object) regions to preserve them
+            brush_only = torch.ones_like(base_mask)
+            if has_add_stroke:
+                brush_only = torch.minimum(brush_only, add_mask)
+            if has_remove_stroke:
+                brush_only = torch.minimum(brush_only, remove_mask)
+            # brush_only now has LOW (<0.5) only where there are brush strokes
+            
+            # The edit region is the brush strokes, not the entire base_mask
+            original_mask = self._expand_mask((brush_only < 0.5).float(), expand=25)
+            
+            # Preserve only matted/base regions that are NOT brush strokes.
+            base_active = (base_mask < 0.5).float()
+            brush_active = (brush_only < 0.5).float()
+            matted_only = torch.clamp(base_active - brush_active, 0.0, 1.0)
+            matted_object_mask = self._expand_mask(matted_only, expand=10)
+        else:
+            # No brush strokes, use base_mask as before
+            original_mask = self._expand_mask((base_mask < 0.5).float(), expand=25)
+            matted_object_mask = self._expand_mask((base_mask < 0.5).float(), expand=10)
 
         image_pil = self._tensor_to_pil(image)
         control_dict = {}
         lineart_output = None
 
         # Color brush -> color-block condition; otherwise edge/scribble condition.
-        if not torch.equal(image, colored_image):
+        # Require a meaningful color-layer delta (not just merged-vs-background differences).
+        color_delta = (image - colored_image).abs().max().item() if image.shape == colored_image.shape else 1.0
+        use_color_control = color_delta > 1e-3 and not torch.equal(image, colored_image)
+        if use_color_control:
             print("Apply color control")
             colored_image_pil = self._tensor_to_pil(colored_image)
             color_image_np = np.array(colored_image_pil)
@@ -389,6 +461,16 @@ class KontextEditModel():
         self.clear_cache()
 
         final_image = self._pil_to_tensor(result_pil)
+        
+        # CRITICAL FIX: Composite with matted objects to preserve them
+        # If we have matted objects, blend the generated result back using the matted object mask
+        # This ensures matted objects are restored where they should be preserved
+        if matted_object_mask is not None and torch.sum(matted_object_mask > 0.5).item() > 0:
+            final_image = self._composite_preserve_mask(
+                final_image, original_image_tensor, matted_object_mask, "matted objects"
+            )
+            print("[OK] Matted objects preserved with smooth blending")
+        
         return (final_image, debug_image, original_mask)
 
     def object_removal(self,
@@ -423,11 +505,33 @@ class KontextEditModel():
         self.clear_cache()
 
         final_image = self._pil_to_tensor(result_pil)
+        
+        # Apply smooth blending to preserve boundary quality
+        # Blur the mask for anti-aliasing at the boundary between generated and original
+        try:
+            original_mask_pil = self._tensor_to_pil(original_mask)
+            original_mask_np = np.array(original_mask_pil)
+            if original_mask_np.ndim == 3:  # Handle RGB/RGBA
+                original_mask_np = original_mask_np[:, :, 0]
+            blurred_mask = cv2.GaussianBlur(original_mask_np, (11, 11), 3.0)
+            # _pil_to_tensor returns (1, H, W, C), so use (1, H, W, 1) for blend mask
+            blend_mask_smooth = torch.from_numpy(blurred_mask / 255.0).float().unsqueeze(0).unsqueeze(-1)
+            
+            # Ensure original image is channels-last for blending
+            original_blend = self._ensure_channels_last(original_image_tensor, "original_image_tensor")
+            
+            # original_mask marks the edited region (high inside edited area),
+            # so keep generated pixels where mask is high, preserve original outside.
+            final_image = final_image * blend_mask_smooth + original_blend * (1.0 - blend_mask_smooth)
+            print("[OK] Object removal with smooth blending")
+        except Exception as e:
+            print(f"[WARN] Smooth blending failed ({e}), using generated result directly")
+        
         return (final_image, self._pil_to_tensor(spatial_pil), original_mask)
 
     def local_edit(self,
                    image, positive_prompt, fill_mask, local_strength,
-                   seed, steps, cfg):
+                   seed, steps, cfg, preserve_mask=None):
         generator = torch.Generator(device=self.device).manual_seed(seed)
         original_image_tensor = image.clone()
         original_mask = self._expand_mask((fill_mask < 0.5).float(), expand=10)
@@ -454,6 +558,32 @@ class KontextEditModel():
         self.clear_cache()
 
         final_image = self._pil_to_tensor(result_pil)
+        
+        # Apply smooth blending to preserve boundary quality
+        try:
+            original_mask_pil = self._tensor_to_pil(original_mask)
+            original_mask_np = np.array(original_mask_pil)
+            if original_mask_np.ndim == 3:  # Handle RGB/RGBA
+                original_mask_np = original_mask_np[:, :, 0]
+            blurred_mask = cv2.GaussianBlur(original_mask_np, (11, 11), 3.0)
+            # _pil_to_tensor returns (1, H, W, C), so use (1, H, W, 1) for blend mask
+            blend_mask_smooth = torch.from_numpy(blurred_mask / 255.0).float().unsqueeze(0).unsqueeze(-1)
+            
+            # Ensure original image is channels-last for blending
+            original_blend = self._ensure_channels_last(original_image_tensor, "original_image_tensor")
+            
+            # original_mask marks the edited region (high inside edited area),
+            # so keep generated pixels where mask is high, preserve original outside.
+            final_image = final_image * blend_mask_smooth + original_blend * (1.0 - blend_mask_smooth)
+            print("[OK] Local edit with smooth blending")
+        except Exception as e:
+            print(f"[WARN] Smooth blending failed ({e}), using generated result directly")
+
+        if preserve_mask is not None:
+            final_image = self._composite_preserve_mask(
+                final_image, original_image_tensor, preserve_mask, "matted objects"
+            )
+        
         return (final_image, self._pil_to_tensor(spatial_pil), original_mask)
 
     def foreground_edit(self,
@@ -465,25 +595,34 @@ class KontextEditModel():
         # app.py no longer prepends the foreground instruction, so build it here.
         positive_prompt = (
             "Fill in the white region naturally and adapt the foreground into the background. "
+            "Preserve existing matted/pasted characters and objects outside the edited brush region. "
             + positive_prompt
         )
         if fix_perspective == "enable":
             positive_prompt = positive_prompt + " Fix the perspective if necessary."
 
+        merged_original = self._ensure_channels_last(merged_image.clone(), "merged_image")
+
         # Convert brush masks to stroke-high so we can reuse the original logic.
         prop_hi = (add_prop_mask < 0.5).float()
         fill_hi = (fill_mask < 0.5).float()
+        has_fill_stroke = torch.sum(fill_hi > 0.5).item() > 0
 
-        edit_mask = torch.clamp(self._expand_mask(prop_hi, expand=grow_size) + fill_hi, 0.0, 1.0)
-        final_mask = self._expand_mask(edit_mask, expand=25)
+        if has_fill_stroke:
+            # Magic-quill fill brush: only regenerate the brushed fill region.
+            edit_mask = self._expand_mask(fill_hi, expand=25)
+            white_region = fill_hi > 0.5
+        else:
+            # Prop integration: white halo around pasted props for backdrop fill.
+            edit_mask = torch.clamp(self._expand_mask(prop_hi, expand=grow_size), 0.0, 1.0)
+            white_region = ((prop_hi <= 0.5) & (edit_mask > 0.5)).squeeze(0)
 
-        # Inside the edit region but outside the pasted object -> paint white so the
-        # model regenerates the background around the inserted foreground.
-        img = merged_image.clone()
-        base_mask_bool = (edit_mask > 0.5)
-        add_only = (prop_hi <= 0.5) & base_mask_bool  # [1, H, W] bool
-        add_only_3 = add_only.squeeze(0).unsqueeze(-1).expand(-1, -1, img.shape[-1])
-        img[0] = torch.where(add_only_3, torch.ones_like(img[0]), img[0])
+        # Paint white only in regions that should be regenerated (never on matted props).
+        img = merged_original.clone()
+        if white_region.ndim == 3:
+            white_region = white_region.squeeze(0)
+        white_3 = white_region.unsqueeze(-1).expand(-1, -1, img.shape[-1])
+        img[0] = torch.where(white_3, torch.ones_like(img[0]), img[0])
 
         image_pil = self._tensor_to_pil(img)
 
@@ -505,6 +644,22 @@ class KontextEditModel():
         self.clear_cache()
 
         final_image = self._pil_to_tensor(result_pil)
+        
+        # Blend generated content into edit region, then hard-lock matted props back in.
+        try:
+            edit_blend = self._mask_to_blend_tensor(edit_mask)
+            final_image = self._ensure_channels_last(final_image, "final_image")
+            final_image = final_image * edit_blend + merged_original * (1.0 - edit_blend)
+            final_image = self._composite_preserve_mask(
+                final_image, merged_original, self._expand_mask(prop_hi, expand=3), "matted props"
+            )
+            print("[OK] Foreground edit with matted preservation")
+        except Exception as e:
+            print(f"[WARN] Smooth blending failed ({e}), using generated result directly")
+            final_image = self._composite_preserve_mask(
+                final_image, merged_original, prop_hi, "matted props (fallback)"
+            )
+        
         return (final_image, self._pil_to_tensor(image_pil), edit_mask)
 
     def kontext_edit(self,
@@ -538,7 +693,13 @@ class KontextEditModel():
         if flag == "foreground":
             return self.foreground_edit(merged_image, positive_prompt, add_prop_mask, fill_mask, total_mask, fix_perspective, grow_size, seed, steps, cfg)
         elif flag == "local":
-            return self.local_edit(image, positive_prompt, fill_mask, local_strength, seed, steps, cfg)
+            preserve_mask = None
+            if torch.sum(add_prop_mask < 0.5).item() > 0:
+                preserve_mask = self._expand_mask((add_prop_mask < 0.5).float(), expand=3)
+            return self.local_edit(
+                image, positive_prompt, fill_mask, local_strength, seed, steps, cfg,
+                preserve_mask=preserve_mask,
+            )
         elif flag == "removal":
             return self.object_removal(image, positive_prompt, remove_mask, local_strength, seed, steps, cfg)
         elif flag == "precise_edit":
