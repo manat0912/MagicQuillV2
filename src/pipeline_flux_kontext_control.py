@@ -306,16 +306,6 @@ class FluxKontextControlPipeline(
             self.control_lora_weights[control_type] = config["lora_weights"]
         print("All control LoRAs loaded and prepared.")
 
-    def _lora_compute_dtype(self) -> torch.dtype:
-        """LoRA layers must be created in a standard float dtype (not GGUF/quant storage dtypes)."""
-        try:
-            dtype = next(self.transformer.parameters()).dtype
-        except StopIteration:
-            return torch.bfloat16
-        if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-            return dtype
-        return torch.bfloat16
-
     def _combine_control_loras(self, control_types: List[str]):
         """
         Combines multiple control LoRAs into a single set of attention processors.
@@ -326,10 +316,10 @@ class FluxKontextControlPipeline(
         try:
             first_param = next(self.transformer.parameters())
             target_device = first_param.device
-            target_dtype = self._lora_compute_dtype()
+            target_dtype = first_param.dtype
         except StopIteration:
             target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            target_dtype = torch.bfloat16
+            target_dtype = torch.float32
 
         combined_procs = {}
         # LoRA weights must come from configuration, not from gammas (which control strength)
@@ -411,10 +401,10 @@ class FluxKontextControlPipeline(
         try:
             first_param = next(self.transformer.parameters())
             device = first_param.device
-            dtype = self._lora_compute_dtype()
+            dtype = first_param.dtype
         except StopIteration:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            dtype = torch.bfloat16
+            dtype = torch.float32
         gamma_tensor = torch.tensor(gammas, device=device, dtype=dtype)
         for name, attn_processor in self.transformer.attn_processors.items():
             if hasattr(attn_processor, 'q_loras'):
@@ -880,6 +870,34 @@ class FluxKontextControlPipeline(
         return self._interrupt
 
     @torch.no_grad()
+    def fit_kontext_resolution(self, image):
+        """
+        Snap an image to the nearest Kontext-friendly resolution, optionally
+        capped to `self.max_working_side` (long side, in px) to keep the token
+        count / activation memory within a small (e.g. 12 GB) VRAM budget.
+        Returns (width, height), both multiples of vae_scale_factor * 2.
+        """
+        img = image[0] if isinstance(image, list) else image
+        image_height, image_width = self.image_processor.get_default_height_width(img)
+        aspect_ratio = image_width / image_height
+        # Kontext is trained on specific resolutions, using one of them is recommended
+        _, image_width, image_height = min(
+            (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
+        )
+        multiple_of = self.vae_scale_factor * 2
+        image_width = image_width // multiple_of * multiple_of
+        image_height = image_height // multiple_of * multiple_of
+
+        max_side = getattr(self, "max_working_side", None)
+        if max_side:
+            longest = max(image_width, image_height)
+            if longest > max_side:
+                scale = max_side / longest
+                image_width = max(multiple_of, int(image_width * scale) // multiple_of * multiple_of)
+                image_height = max(multiple_of, int(image_height * scale) // multiple_of * multiple_of)
+        return image_width, image_height
+
+    @torch.no_grad()
     def __call__(
         self,
         image: Optional[PipelineImageInput] = None,
@@ -1086,15 +1104,7 @@ class FluxKontextControlPipeline(
         # 3. Preprocess images
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
             img = image[0] if isinstance(image, list) else image
-            image_height, image_width = self.image_processor.get_default_height_width(img)
-            aspect_ratio = image_width / image_height
-            # Kontext is trained on specific resolutions, using one of them is recommended
-            _, image_width, image_height = min(
-                (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
-            )
-            multiple_of = self.vae_scale_factor * 2
-            image_width = image_width // multiple_of * multiple_of
-            image_height = image_height // multiple_of * multiple_of
+            image_width, image_height = self.fit_kontext_resolution(img)
             image = self.image_processor.resize(image, image_height, image_width)
             image = self.image_processor.preprocess(image, image_height, image_width)
 

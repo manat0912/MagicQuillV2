@@ -233,13 +233,24 @@ class KontextEditModel():
         except Exception as e:
             print(f"Failed to enable VAE tiling: {e}")
 
+        # Cap the working resolution so the ~1MP Kontext double-sequence + GGUF
+        # transformer fit in ~12GB VRAM (otherwise Windows spills into shared RAM
+        # over PCIe -> hundreds of seconds per step). Override with the
+        # MAGICQUILL_MAX_SIDE env var (e.g. 768 for tighter VRAM, 1280 for more).
+        self.pipe.max_working_side = int(os.environ.get("MAGICQUILL_MAX_SIDE", "1024"))
+        print(f"[Speed] max_working_side = {self.pipe.max_working_side} px")
+
+        # Smaller control condition -> fewer cached cond tokens (less VRAM), still
+        # enough to steer the brush. Override with MAGICQUILL_COND_SIZE.
+        cond_size = int(os.environ.get("MAGICQUILL_COND_SIZE", "256"))
+
         # 6. EasyControl task LoRAs — this is what makes brush + prompt edits
         #    actually follow the strokes.
         control_lora_config = {
-            "local":   {"path": os.path.join(easycontrol_base_dir, "local_lora.safetensors"),   "lora_weights": [1.0], "cond_size": 512},
-            "removal": {"path": os.path.join(easycontrol_base_dir, "removal_lora.safetensors"), "lora_weights": [1.0], "cond_size": 512},
-            "edge":    {"path": os.path.join(easycontrol_base_dir, "edge_lora.safetensors"),    "lora_weights": [1.0], "cond_size": 512},
-            "color":   {"path": os.path.join(easycontrol_base_dir, "color_lora.safetensors"),   "lora_weights": [1.0], "cond_size": 512},
+            "local":   {"path": os.path.join(easycontrol_base_dir, "local_lora.safetensors"),   "lora_weights": [1.0], "cond_size": cond_size},
+            "removal": {"path": os.path.join(easycontrol_base_dir, "removal_lora.safetensors"), "lora_weights": [1.0], "cond_size": cond_size},
+            "edge":    {"path": os.path.join(easycontrol_base_dir, "edge_lora.safetensors"),    "lora_weights": [1.0], "cond_size": cond_size},
+            "color":   {"path": os.path.join(easycontrol_base_dir, "color_lora.safetensors"),   "lora_weights": [1.0], "cond_size": cond_size},
         }
         self.pipe.load_control_loras(control_lora_config)
         print("[OK] EasyControl task LoRAs loaded.")
@@ -450,8 +461,8 @@ class KontextEditModel():
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
-            height=image_pil.height,
-            width=image_pil.width,
+            height=self.pipe.fit_kontext_resolution(image_pil)[1],
+            width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
             num_inference_steps=steps,
             generator=generator,
@@ -494,8 +505,8 @@ class KontextEditModel():
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
-            height=image_pil.height,
-            width=image_pil.width,
+            height=self.pipe.fit_kontext_resolution(image_pil)[1],
+            width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
             num_inference_steps=steps,
             generator=generator,
@@ -547,8 +558,8 @@ class KontextEditModel():
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
-            height=image_pil.height,
-            width=image_pil.width,
+            height=self.pipe.fit_kontext_resolution(image_pil)[1],
+            width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
             num_inference_steps=steps,
             generator=generator,
@@ -631,8 +642,8 @@ class KontextEditModel():
             result_pil = self.pipe(
                 prompt=positive_prompt,
                 image=image_pil,
-                height=image_pil.height,
-                width=image_pil.width,
+                height=self.pipe.fit_kontext_resolution(image_pil)[1],
+                width=self.pipe.fit_kontext_resolution(image_pil)[0],
                 guidance_scale=cfg,
                 num_inference_steps=steps,
                 generator=generator,
@@ -671,8 +682,8 @@ class KontextEditModel():
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
-            height=image_pil.height,
-            width=image_pil.width,
+            height=self.pipe.fit_kontext_resolution(image_pil)[1],
+            width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
             num_inference_steps=steps,
             generator=generator,
