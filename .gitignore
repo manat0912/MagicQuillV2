@@ -1,0 +1,18 @@
+# Virtual Environment
+env/
+
+# Large model files and checkpoints
+models/
+
+# Python caching and byte-code
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Debug and output test images
+debug_kontext_raw_output.png
+foreground_test_debug.png
+foreground_test_in.png
+foreground_test_out.png
+short_test_out.png
