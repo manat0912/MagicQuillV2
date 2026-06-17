@@ -306,6 +306,16 @@ class FluxKontextControlPipeline(
             self.control_lora_weights[control_type] = config["lora_weights"]
         print("All control LoRAs loaded and prepared.")
 
+    def _lora_compute_dtype(self) -> torch.dtype:
+        """LoRA layers must be created in a standard float dtype (not GGUF/quant storage dtypes)."""
+        try:
+            dtype = next(self.transformer.parameters()).dtype
+        except StopIteration:
+            return torch.bfloat16
+        if dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            return dtype
+        return torch.bfloat16
+
     def _combine_control_loras(self, control_types: List[str]):
         """
         Combines multiple control LoRAs into a single set of attention processors.
@@ -316,10 +326,10 @@ class FluxKontextControlPipeline(
         try:
             first_param = next(self.transformer.parameters())
             target_device = first_param.device
-            target_dtype = first_param.dtype
+            target_dtype = self._lora_compute_dtype()
         except StopIteration:
             target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            target_dtype = torch.float32
+            target_dtype = torch.bfloat16
 
         combined_procs = {}
         # LoRA weights must come from configuration, not from gammas (which control strength)
@@ -401,10 +411,10 @@ class FluxKontextControlPipeline(
         try:
             first_param = next(self.transformer.parameters())
             device = first_param.device
-            dtype = first_param.dtype
+            dtype = self._lora_compute_dtype()
         except StopIteration:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            dtype = torch.float32
+            dtype = torch.bfloat16
         gamma_tensor = torch.tensor(gammas, device=device, dtype=dtype)
         for name, attn_processor in self.transformer.attn_processors.items():
             if hasattr(attn_processor, 'q_loras'):
