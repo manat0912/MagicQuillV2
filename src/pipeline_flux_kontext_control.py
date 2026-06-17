@@ -870,6 +870,34 @@ class FluxKontextControlPipeline(
         return self._interrupt
 
     @torch.no_grad()
+    def fit_kontext_resolution(self, image):
+        """
+        Snap an image to the nearest Kontext-friendly resolution, optionally
+        capped to `self.max_working_side` (long side, in px) to keep the token
+        count / activation memory within a small (e.g. 12 GB) VRAM budget.
+        Returns (width, height), both multiples of vae_scale_factor * 2.
+        """
+        img = image[0] if isinstance(image, list) else image
+        image_height, image_width = self.image_processor.get_default_height_width(img)
+        aspect_ratio = image_width / image_height
+        # Kontext is trained on specific resolutions, using one of them is recommended
+        _, image_width, image_height = min(
+            (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
+        )
+        multiple_of = self.vae_scale_factor * 2
+        image_width = image_width // multiple_of * multiple_of
+        image_height = image_height // multiple_of * multiple_of
+
+        max_side = getattr(self, "max_working_side", None)
+        if max_side:
+            longest = max(image_width, image_height)
+            if longest > max_side:
+                scale = max_side / longest
+                image_width = max(multiple_of, int(image_width * scale) // multiple_of * multiple_of)
+                image_height = max(multiple_of, int(image_height * scale) // multiple_of * multiple_of)
+        return image_width, image_height
+
+    @torch.no_grad()
     def __call__(
         self,
         image: Optional[PipelineImageInput] = None,
@@ -1076,15 +1104,7 @@ class FluxKontextControlPipeline(
         # 3. Preprocess images
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
             img = image[0] if isinstance(image, list) else image
-            image_height, image_width = self.image_processor.get_default_height_width(img)
-            aspect_ratio = image_width / image_height
-            # Kontext is trained on specific resolutions, using one of them is recommended
-            _, image_width, image_height = min(
-                (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
-            )
-            multiple_of = self.vae_scale_factor * 2
-            image_width = image_width // multiple_of * multiple_of
-            image_height = image_height // multiple_of * multiple_of
+            image_width, image_height = self.fit_kontext_resolution(img)
             image = self.image_processor.resize(image, image_height, image_width)
             image = self.image_processor.preprocess(image, image_height, image_width)
 
