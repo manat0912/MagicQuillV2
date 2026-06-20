@@ -731,6 +731,8 @@ class KontextEditModel():
                 total_mask, add_mask, remove_mask, add_prop_mask, fill_mask,
                 fine_edge, fix_perspective, edge_strength, color_strength, local_strength, grow_size,
                 seed, steps, cfg, flag="precise_edit"):
+        # Force num_inference_steps to a hardcoded range of 17-18 steps
+        steps = min(max(steps, 17), 18)
         if flag == "foreground":
             return self.foreground_edit(merged_image, positive_prompt, add_prop_mask, fill_mask, total_mask, fix_perspective, grow_size, seed, steps, cfg)
         elif flag == "local":
