@@ -3,6 +3,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 from transformers import (
     CLIPImageProcessor,
     CLIPTextModel,
@@ -919,6 +921,7 @@ class FluxKontextControlPipeline(
     def __call__(
         self,
         image: Optional[PipelineImageInput] = None,
+        mask_image: Optional[Union[torch.Tensor, Image.Image]] = None,
         prompt: Union[str, List[str]] = None,
         prompt_2: Optional[Union[str, List[str]]] = None,
         height: Optional[int] = None,
@@ -1173,6 +1176,38 @@ class FluxKontextControlPipeline(
             num_spatial_images=num_spatial_images,
         )
 
+        # 4.5. Prepare mask packed tensor if mask_image is provided
+        mask_packed = None
+        initial_noise = None
+        if mask_image is not None and image is not None:
+            img = image[0] if isinstance(image, list) else image
+            image_width, image_height = self.fit_kontext_resolution(img)
+            
+            if isinstance(mask_image, Image.Image):
+                mask_tensor = np.array(mask_image.convert("L")).astype(np.float32) / 255.0
+                mask_tensor = torch.from_numpy(mask_tensor).to(device=device, dtype=prompt_embeds.dtype)
+            elif isinstance(mask_image, np.ndarray):
+                mask_tensor = mask_image.astype(np.float32)
+                if mask_tensor.max() > 1.0:
+                    mask_tensor /= 255.0
+                mask_tensor = torch.from_numpy(mask_tensor).to(device=device, dtype=prompt_embeds.dtype)
+            else:
+                mask_tensor = mask_image.to(device=device, dtype=prompt_embeds.dtype)
+            
+            if mask_tensor.ndim == 2:
+                mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+            elif mask_tensor.ndim == 3:
+                if mask_tensor.shape[0] == 1:
+                    mask_tensor = mask_tensor.unsqueeze(0)
+                else:
+                    mask_tensor = mask_tensor.unsqueeze(1)
+            
+            h_latent = image_height // 16
+            w_latent = image_width // 16
+            mask_resized = F.interpolate(mask_tensor, size=(h_latent, w_latent), mode="nearest")
+            mask_packed = mask_resized.view(batch_size * num_images_per_prompt, h_latent * w_latent, 1)
+            initial_noise = latents.clone()
+
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
         # sigmas = np.array([1.0000, 0.9836, 0.9660, 0.9471, 0.9266, 0.9045, 0.8805, 0.8543, 0.8257, 0.7942, 0.7595, 0.7210, 0.6780, 0.6297, 0.5751, 0.5128, 0.4412, 0.3579, 0.2598, 0.1425])
@@ -1272,6 +1307,14 @@ class FluxKontextControlPipeline(
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
+
+                # Step-by-step latent blending for inpainting
+                if mask_packed is not None and image_latents is not None:
+                    normalized_t = (t / 1000.0).to(device=latents.device, dtype=latents.dtype)
+                    # Linearly interpolate between original image latents and initial noise matching Flow Matching Euler
+                    noisy_image_latents = (1.0 - normalized_t) * image_latents + normalized_t * initial_noise
+                    # Blend: keep generated inside mask (>0.5), preserve original outside (<=0.5)
+                    latents = torch.where(mask_packed > 0.5, latents, noisy_image_latents)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

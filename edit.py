@@ -481,6 +481,7 @@ class KontextEditModel():
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
+            mask_image=original_mask,
             height=self.pipe.fit_kontext_resolution(image_pil)[1],
             width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
@@ -525,6 +526,7 @@ class KontextEditModel():
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
+            mask_image=original_mask,
             height=self.pipe.fit_kontext_resolution(image_pil)[1],
             width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
@@ -578,6 +580,7 @@ class KontextEditModel():
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
+            mask_image=original_mask,
             height=self.pipe.fit_kontext_resolution(image_pil)[1],
             width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
@@ -672,6 +675,7 @@ class KontextEditModel():
             result_pil = self.pipe(
                 prompt=positive_prompt,
                 image=image_pil,
+                mask_image=edit_mask,
                 height=self.pipe.fit_kontext_resolution(image_pil)[1],
                 width=self.pipe.fit_kontext_resolution(image_pil)[0],
                 guidance_scale=cfg,

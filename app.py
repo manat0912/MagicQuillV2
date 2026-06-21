@@ -76,15 +76,20 @@ def generate(merged_image, total_mask, original_image, add_color_image, add_edge
     add_prop_mask = create_alpha_mask(read_base64_image_utils(add_prop_image)) if add_prop_image else torch.ones_like(total_mask_tensor)
     fill_mask_tensor = create_alpha_mask(read_base64_image_utils(fill_mask)) if fill_mask else torch.ones_like(total_mask_tensor)
 
-    # Clean the checkered brush pattern in the fill mask region of the merged canvas
-    # by replacing the checkered region (mask < 0.5) with the clean original background image.
-    has_fill = torch.sum(fill_mask_tensor < 0.5).item() > 0
-    if has_fill:
-        merged_image_tensor = torch.where(
-            fill_mask_tensor.unsqueeze(-1) < 0.5,
-            original_image_tensor,
-            merged_image_tensor
-        )
+    # Clean the checkered brush pattern in the merged canvas
+    # by reconstructing the canvas (combining original background with clean pasted props)
+    # to avoid having checkers in the VAE input or erasing props.
+    if add_prop_image:
+        try:
+            prop_pil = Image.open(read_base64_image_utils(add_prop_image)).convert("RGBA")
+            prop_alpha_np = np.array(prop_pil.getchannel('A')).astype(np.float32) / 255.0
+            prop_alpha = torch.from_numpy(prop_alpha_np).to(device=original_image_tensor.device, dtype=original_image_tensor.dtype)[None, ..., None]
+            prop_rgb = load_and_preprocess_image(read_base64_image_utils(add_prop_image)).to(device=original_image_tensor.device, dtype=original_image_tensor.dtype)
+            
+            merged_image_tensor = prop_rgb * prop_alpha + original_image_tensor * (1.0 - prop_alpha)
+            print("[OK] Reconstructed clean merged canvas with props (no checkers)")
+        except Exception as e:
+            print(f"[WARN] Failed to reconstruct clean merged canvas ({e}), using default merged canvas")
 
     # Some UI flows record magic-quill strokes only on total_mask (not add_edge_mask).
     extra_active = torch.clamp((total_mask_tensor < 0.5).float() - (add_prop_mask < 0.5).float(), 0.0, 1.0)
