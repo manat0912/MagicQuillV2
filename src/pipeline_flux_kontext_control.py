@@ -333,10 +333,8 @@ class FluxKontextControlPipeline(
             target_dtype = torch.float32
 
         combined_procs = {}
-        # LoRA weights must come from configuration, not from gammas (which control strength)
         all_lora_weights = []
         
-        # Determine total number of LoRAs and ranks across all control types
         total_loras = 0
         all_ranks = []
         all_cond_sizes = []
@@ -345,18 +343,15 @@ class FluxKontextControlPipeline(
             procs = self.control_lora_processors.get(control_type)
             if not procs:
                 raise ValueError(f"Control type '{control_type}' not loaded.")
-            # Collect configured LoRA weights for this control type
             conf_weights = self.control_lora_weights.get(control_type)
             if conf_weights is None:
                 raise ValueError(f"Control type '{control_type}' has no configured lora_weights.")
             all_lora_weights.extend(conf_weights)
             
-            # Get n_loras from the first processor
             first_proc = next(iter(procs.values()))
             n_loras_in_control = first_proc.n_loras
             total_loras += n_loras_in_control
             
-            # Correctly get ranks from the processor's LoRA layers
             proc_ranks = [lora.down.weight.shape[0] for lora in first_proc.q_loras]
             all_ranks.extend(proc_ranks)
 
@@ -390,7 +385,6 @@ class FluxKontextControlPipeline(
                 source_proc = self.control_lora_processors[control_type][name]
                 for i in range(source_proc.n_loras):
                     current_lora_idx = lora_idx_offset + i
-                    # Copy weights for q, k, v, proj
                     new_proc.q_loras[current_lora_idx].load_state_dict(source_proc.q_loras[i].state_dict())
                     new_proc.k_loras[current_lora_idx].load_state_dict(source_proc.k_loras[i].state_dict())
                     new_proc.v_loras[current_lora_idx].load_state_dict(source_proc.v_loras[i].state_dict())
@@ -408,14 +402,10 @@ class FluxKontextControlPipeline(
         Set gamma values for bias control modulation on current attention processors and attention modules.
         """
         print(f"Setting gamma values to: {gammas}")
-        # Resolve device/dtype robustly from model parameters
         try:
             first_param = next(self.transformer.parameters())
             device = first_param.device
             dtype = first_param.dtype
-            # A quantized base (GGUF uint8 / fp8) must not be used as the gamma
-            # dtype: e.g. torch.tensor([0.5], dtype=uint8) -> 0, which silently
-            # zeroes the control strength. Use a real float dtype instead.
             if (
                 str(dtype).endswith("float8_e4m3fn")
                 or str(dtype).endswith("float8_e5m2")
@@ -429,7 +419,6 @@ class FluxKontextControlPipeline(
         for name, attn_processor in self.transformer.attn_processors.items():
             if hasattr(attn_processor, 'q_loras'):
                 setattr(attn_processor, 'c_factor', gamma_tensor)
-                # print(f"  Set c_factor {gamma_tensor} on processor {name}")
 
     # Copied from diffusers.pipelines.flux.pipeline_flux.FluxPipeline._get_t5_prompt_embeds
     def _get_t5_prompt_embeds(
@@ -471,11 +460,6 @@ class FluxKontextControlPipeline(
 
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
             removed_text = self.tokenizer_2.batch_decode(untruncated_ids[:, max_sequence_length - 1 : -1])
-            # Suppressed warning to prevent confusing the user (T5 successfully handles up to 512 tokens)
-            # logger.warning(
-            #     "The following part of your input was truncated because `max_sequence_length` is set to "
-            #     f" {max_sequence_length} tokens: {removed_text}"
-            # )
 
         prompt_embeds = self.text_encoder_2(text_input_ids.to(self.text_encoder_2.device), output_hidden_states=False)[0]
 
@@ -484,7 +468,6 @@ class FluxKontextControlPipeline(
 
         _, seq_len, _ = prompt_embeds.shape
 
-        # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
@@ -528,18 +511,11 @@ class FluxKontextControlPipeline(
             
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
             removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
-            # Suppressed warning: CLIP's 77 token limit is a hard architectural constraint, but T5 processes the full prompt up to 512 tokens.
-            # logger.warning(
-            #     "The following part of your input was truncated because CLIP can only handle sequences up to"
-            #     f" {self.tokenizer_max_length} tokens: {removed_text}"
-            # )
         prompt_embeds = self.text_encoder(text_input_ids.to(self.text_encoder.device), output_hidden_states=False)
 
-        # Use pooled output of CLIPTextModel
         prompt_embeds = prompt_embeds.pooler_output
         prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
 
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, -1)
 
@@ -557,35 +533,11 @@ class FluxKontextControlPipeline(
         max_sequence_length: int = 512,
         lora_scale: Optional[float] = None,
     ):
-        r"""
-
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                prompt to be encoded
-            prompt_2 (`str` or `List[str]`, *optional*):
-                The prompt or prompts to be sent to the `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
-                used in all text-encoders
-            device: (`torch.device`):
-                torch device
-            num_images_per_prompt (`int`):
-                number of images that should be generated per prompt
-            prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
-                If not provided, pooled text embeddings will be generated from `prompt` input argument.
-            lora_scale (`float`, *optional*):
-                A lora scale that will be applied to all LoRA layers of the text encoder if LoRA layers are loaded.
-        """
         device = device or self._execution_device
 
-        # set lora scale so that monkey patched LoRA
-        # function of text encoder can correctly access it
         if lora_scale is not None and isinstance(self, FluxLoraLoaderMixin):
             self._lora_scale = lora_scale
 
-            # dynamically adjust the LoRA scale
             if self.text_encoder is not None and USE_PEFT_BACKEND:
                 scale_lora_layers(self.text_encoder, lora_scale)
             if self.text_encoder_2 is not None and USE_PEFT_BACKEND:
@@ -597,7 +549,6 @@ class FluxKontextControlPipeline(
             prompt_2 = prompt_2 or prompt
             prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
 
-            # We only use the pooled prompt output from the CLIPTextModel
             pooled_prompt_embeds = self._get_clip_prompt_embeds(
                 prompt=prompt,
                 device=device,
@@ -612,12 +563,10 @@ class FluxKontextControlPipeline(
 
         if self.text_encoder is not None:
             if isinstance(self, FluxLoraLoaderMixin) and USE_PEFT_BACKEND:
-                # Retrieve the original scale by scaling back the LoRA layers
                 unscale_lora_layers(self.text_encoder, lora_scale)
 
         if self.text_encoder_2 is not None:
             if isinstance(self, FluxLoraLoaderMixin) and USE_PEFT_BACKEND:
-                # Retrieve the original scale by scaling back the LoRA layers
                 unscale_lora_layers(self.text_encoder_2, lora_scale)
 
         dtype = self.text_encoder.dtype if self.text_encoder is not None else self.transformer.dtype
@@ -705,8 +654,6 @@ class FluxKontextControlPipeline(
     def _unpack_latents(latents, height, width, vae_scale_factor):
         batch_size, num_patches, channels = latents.shape
 
-        # VAE applies 8x compression on images but we must also account for packing which requires
-        # latent height and width to be divisible by 2.
         height = 2 * (int(height) // (vae_scale_factor * 2))
         width = 2 * (int(width) // (vae_scale_factor * 2))
 
@@ -793,7 +740,7 @@ class FluxKontextControlPipeline(
         width_cond = 2 * (cond_size // (self.vae_scale_factor * 2))
 
         image_latents = image_ids = None
-        image_latent_h = 0  # Initialize to handle case where image is None
+        image_latent_h = 0
 
         # Prepare noise latents
         shape = (batch_size, num_channels_latents, height, width)
@@ -803,11 +750,9 @@ class FluxKontextControlPipeline(
             noise_latents = latents.to(device=device, dtype=dtype)
 
         noise_latents = self._pack_latents(noise_latents, batch_size, num_channels_latents, height, width)
-        # print(noise_latents.shape)
         noise_latent_image_ids, cond_latent_image_ids_resized = resize_position_encoding(
             batch_size, height, width, height_cond, width_cond, device, dtype
         )
-        # noise IDs are marked with 0 in the first channel
         noise_latent_image_ids[..., 0] = 0
 
         cond_latents_to_concat = []
@@ -900,7 +845,6 @@ class FluxKontextControlPipeline(
         img = image[0] if isinstance(image, list) else image
         image_height, image_width = self.image_processor.get_default_height_width(img)
         aspect_ratio = image_width / image_height
-        # Kontext is trained on specific resolutions, using one of them is recommended
         _, image_width, image_height = min(
             (abs(aspect_ratio - w / h), w, h) for w, h in PREFERRED_KONTEXT_RESOLUTIONS
         )
@@ -943,89 +887,10 @@ class FluxKontextControlPipeline(
         cond_size: int = 512,
         control_dict: Optional[Dict[str, Any]] = None,
     ):
-        r"""
-        Function invoked when calling the pipeline for generation.
-
-        Args:
-            image (`torch.Tensor`, `PIL.Image.Image`, `np.ndarray`, `List[torch.Tensor]`, `List[PIL.Image.Image]`, or `List[np.ndarray]`):
-                `Image`, numpy array or tensor representing an image batch to be used as the starting point. For both
-                numpy array and pytorch tensor, the expected value range is between `[0, 1]` If it's a tensor or a list
-                or tensors, the expected shape should be `(B, C, H, W)` or `(C, H, W)`. If it is a numpy array or a
-                list of arrays, the expected shape should be `(B, H, W, C)` or `(H, W, C)` It can also accept image
-                latents as `image`, but if passing latents directly it is not encoded again.
-            prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-                instead.
-            prompt_2 (`str` or `List[str]`, *optional*):
-                The prompt or prompts to be sent to `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
-                will be used instead.
-            height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
-                The height in pixels of the generated image. This is set to 1024 by default for the best results.
-            width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
-                The width in pixels of the generated image. This is set to 1024 by default for the best results.
-            num_inference_steps (`int`, *optional*, defaults to 50):
-                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.
-            sigmas (`List[float]`, *optional*):
-                Custom sigmas to use for the denoising process with schedulers which support a `sigmas` argument in
-                their `set_timesteps` method. If not defined, the default behavior when `num_inference_steps` is passed
-                will be used.
-            guidance_scale (`float`, *optional*, defaults to 3.5):
-                Guidance scale as defined in [Classifier-Free Diffusion
-                Guidance](https://huggingface.co/papers/2207.12598). `guidance_scale` is defined as `w` of equation 2.
-                of [Imagen Paper](https://huggingface.co/papers/2205.11487). Guidance scale is enabled by setting
-                `guidance_scale > 1`. Higher guidance scale encourages to generate images that are closely linked to
-                the text `prompt`, usually at the expense of lower image quality.
-            num_images_per_prompt (`int`, *optional*, defaults to 1):
-                The number of images to generate per prompt.
-            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
-                One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
-                to make generation deterministic.
-            latents (`torch.FloatTensor`, *optional*):
-                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
-                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
-                tensor will ge generated by sampling using the supplied random `generator`.
-            prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            pooled_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated pooled text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting.
-                If not provided, pooled text embeddings will be generated from `prompt` input argument.
-            output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generate image. Choose between
-                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`~pipelines.flux.FluxPipelineOutput`] instead of a plain tuple.
-            joint_attention_kwargs (`dict`, *optional*):
-                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-                `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-            callback_on_step_end (`Callable`, *optional*):
-                A function that calls at the end of each denoising steps during the inference. The function is called
-                with the following arguments: `callback_on_step_end(self: DiffusionPipeline, step: int, timestep: int,
-                callback_kwargs: Dict)`. `callback_kwargs` will include a list of all tensors as specified by
-                `callback_on_step_end_tensor_inputs`.
-            callback_on_step_end_tensor_inputs (`List`, *optional*):
-                The list of tensor inputs for the `callback_on_step_end` function. The tensors specified in the list
-                will be passed as `callback_kwargs` argument. You will only be able to include variables listed in the
-                `._callback_tensor_inputs` attribute of your pipeline class.
-            max_sequence_length (`int` defaults to 512):
-                Maximum sequence length to use with the `prompt`.
-            cond_size (`int`, *optional*, defaults to 512):
-                The size for conditioning images.
-
-        Examples:
-
-        Returns:
-            [`~pipelines.flux.FluxPipelineOutput`] or `tuple`: [`~pipelines.flux.FluxPipelineOutput`] if `return_dict`
-            is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
-            images.
-        """
-
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
-        # 1. Check inputs. Raise error if not correct
+        # 1. Check inputs
         self.check_inputs(
             prompt,
             prompt_2,
@@ -1042,7 +907,6 @@ class FluxKontextControlPipeline(
         self._current_timestep = None
         self._interrupt = False
 
-        # Normalize control_dict to an empty dict so kontext-only inference works without controls
         control_dict = control_dict or {}
 
         spatial_images = control_dict.get("spatial_images", [])
@@ -1052,26 +916,21 @@ class FluxKontextControlPipeline(
 
         requested_control_type = control_dict.get("type") or None
 
-        # Normalize to list for unified handling
         if requested_control_type and isinstance(requested_control_type, str):
             requested_control_type = [requested_control_type]
 
-        # Revert to default if no control type is requested and a control is active
         if not requested_control_type and self.current_control_type:
             print("Reverting to default attention processors.")
             self.transformer.set_attn_processor(FluxAttnProcessor2_0())
             self.current_control_type = None
-        # Switch processors only if the control type(s) have changed
         elif requested_control_type != self.current_control_type:
             if requested_control_type:
                 print(f"Switching to LoRA control type(s): {requested_control_type}")
                 processors = self._combine_control_loras(requested_control_type)
                 self.transformer.set_attn_processor(processors)
-                # For cond_size, we assume they are compatible and just use the first one.
                 self.cond_size = self.control_lora_cond_sizes[requested_control_type[0]]
                 self.current_control_type = requested_control_type
 
-        # Align cond_size to selected control type (if any)
         if hasattr(self, "cond_size"):
             selected_cond_size = self.cond_size
             if isinstance(selected_cond_size, list) and len(selected_cond_size) > 0:
@@ -1079,12 +938,10 @@ class FluxKontextControlPipeline(
             elif isinstance(selected_cond_size, int):
                 cond_size = selected_cond_size
 
-        # Set gamma values simply based on provided control_dict['gammas'].
         if requested_control_type:
             raw_gammas = control_dict.get("gammas", [])
             if not isinstance(raw_gammas, list):
                 raw_gammas = [raw_gammas]
-            # flatten one level
             flattened_gammas: List[float] = []
             for g in raw_gammas:
                 if isinstance(g, (list, tuple)):
@@ -1209,8 +1066,13 @@ class FluxKontextControlPipeline(
             initial_noise = latents.clone()
 
         # 5. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        # sigmas = np.array([1.0000, 0.9836, 0.9660, 0.9471, 0.9266, 0.9045, 0.8805, 0.8543, 0.8257, 0.7942, 0.7595, 0.7210, 0.6780, 0.6297, 0.5751, 0.5128, 0.4412, 0.3579, 0.2598, 0.1425])
+        #
+        # IMPORTANT: When num_inference_steps is 18 or fewer (fill-brush / local-edit
+        # paths), we SKIP the custom sigma linspace and use the scheduler's native
+        # num_inference_steps path.  The sigma linspace -> mu-shift path was causing
+        # the FlowMatchEulerDiscrete scheduler to silently re-expand the schedule
+        # into 100+ denoising steps regardless of the value we passed in.
+        # For larger step counts (user-set on other modes) we keep the existing path.
         image_seq_len = latents.shape[1]
         mu = calculate_shift(
             image_seq_len,
@@ -1219,17 +1081,29 @@ class FluxKontextControlPipeline(
             self.scheduler.config.get("base_shift", 0.5),
             self.scheduler.config.get("max_shift", 1.15),
         )
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
-        )
+        if sigmas is None and num_inference_steps <= 18:
+            # Fast-path: let the scheduler produce exactly num_inference_steps timesteps.
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler,
+                num_inference_steps,
+                device,
+                mu=mu,
+            )
+        else:
+            # Standard path: caller supplied custom sigmas, or step count is large.
+            if sigmas is None:
+                sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler,
+                num_inference_steps,
+                device,
+                sigmas=sigmas,
+                mu=mu,
+            )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
+        print(f"[INFO] num_inference_steps={num_inference_steps}, actual timesteps={len(timesteps)}")
 
-        # handle guidance
         if self.transformer.config.guidance_embeds:
             guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
             guidance = guidance.expand(latents.shape[0])
@@ -1239,7 +1113,6 @@ class FluxKontextControlPipeline(
         if self.joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
 
-        # K/V Caching
         for name, attn_processor in self.transformer.attn_processors.items():
             if hasattr(attn_processor, "bank_kv"):
                 attn_processor.bank_kv.clear()
@@ -1299,21 +1172,38 @@ class FluxKontextControlPipeline(
 
                 noise_pred = noise_pred[:, : latents.size(1)]
 
-                # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
-                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
 
                 # Step-by-step latent blending for inpainting
                 if mask_packed is not None and image_latents is not None:
-                    normalized_t = (t / 1000.0).to(device=latents.device, dtype=latents.dtype)
-                    # Linearly interpolate between original image latents and initial noise matching Flow Matching Euler
-                    noisy_image_latents = (1.0 - normalized_t) * image_latents + normalized_t * initial_noise
-                    # Blend: keep generated inside mask (>0.5), preserve original outside (<=0.5)
+                    # Cast image_latents, initial_noise, and mask_packed to match latents' device and dtype
+                    image_latents = image_latents.to(device=latents.device, dtype=latents.dtype)
+                    initial_noise = initial_noise.to(device=latents.device, dtype=latents.dtype)
+                    mask_packed = mask_packed.to(device=latents.device, dtype=latents.dtype)
+                    
+                    # --- ADD THIS SHAPE PROTECTION FOR PACKED FLUX LATENTS ---
+                    if image_latents.shape != latents.shape:
+                        image_latents = image_latents.expand_as(latents)
+                    if initial_noise.shape != latents.shape:
+                        initial_noise = initial_noise.expand_as(latents)
+                    # --------------------------------------------------------
+                    
+                    if i < len(timesteps) - 1:
+                        next_t = timesteps[i + 1]
+                        normalized_t = (next_t / 1000.0).to(device=latents.device, dtype=latents.dtype)
+                        noisy_image_latents = (1.0 - normalized_t) * image_latents + normalized_t * initial_noise
+                    else:
+                        noisy_image_latents = image_latents
+                        
+                    # Handle dimension matching for channel-packed Flux latents
+                    if mask_packed.shape != latents.shape:
+                        mask_packed = mask_packed.expand_as(latents)
+                        
                     latents = torch.where(mask_packed > 0.5, latents, noisy_image_latents)
 
                 if callback_on_step_end is not None:
@@ -1325,7 +1215,6 @@ class FluxKontextControlPipeline(
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
 
@@ -1347,7 +1236,6 @@ class FluxKontextControlPipeline(
                 torch.cuda.empty_cache()
             image = self.image_processor.postprocess(image, output_type=output_type)
 
-        # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:

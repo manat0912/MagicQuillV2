@@ -92,6 +92,23 @@ from segment_anything import sam_model_registry, SamPredictor
 TEST_MODE = False
 
 
+def to_active_high_mask(mask_tensor: torch.Tensor) -> torch.Tensor:
+    if mask_tensor is None:
+        return torch.zeros((1, 512, 512), dtype=torch.float32)
+    
+    # Strip any singleton channel axes to check data shape accurately
+    flat_mask = mask_tensor.clone().detach()
+    
+    # Frontend passes 0.0 for brush strokes and 1.0 for background (active-low).
+    # If there are zero pixels below 0.1, nothing was brushed -> return empty mask.
+    if torch.sum(flat_mask < 0.1).item() == 0:
+        return torch.zeros_like(mask_tensor)
+        
+    # Active-low (0.0 inside stroke, 1.0 outside) -> Active-high conversion
+    # Explicitly marks the brush stroke zone for the transformer loop.
+    return (flat_mask < 0.5).float()
+
+
 class KontextEditModel():
     """
     MagicQuill V2 editing engine, loaded for low (≈12 GB) VRAM:
@@ -280,8 +297,6 @@ class KontextEditModel():
         return torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0).unsqueeze(0)
 
     def _debug_dump(self, name, tensor):
-        # Save a tensor (mask or image) to ./debug_masks for inspection.
-        # Enabled only when MAGICQUILL_DEBUG_MASKS is set, so normal runs are unaffected.
         if not os.environ.get("MAGICQUILL_DEBUG_MASKS"):
             return
         try:
@@ -295,12 +310,11 @@ class KontextEditModel():
             Image.fromarray(arr).save(os.path.join(out_dir, f"{name}.png"))
             lo, hi = float(tensor.min()), float(tensor.max())
             frac_lt = float((tensor < 0.5).float().mean())
-            print(f"[DEBUG] dumped {name}: shape={tuple(tensor.shape)} min={lo:.3f} max={hi:.3f} frac(<0.5)={frac_lt:.3f}")
+            print(f"[DEBUG] dumped {name}: shape={tuple(tensor.shape)} min={lo:.3f} max={hi:.3f} fraction(<0.5)={frac_lt:.3f}")
         except Exception as e:
             print(f"[DEBUG] failed to dump {name}: {e}")
 
     def _ensure_channels_last(self, image_tensor: torch.Tensor, name: str = "image") -> torch.Tensor:
-        # Normalize image tensors to (1, H, W, C) for all blend operations.
         if image_tensor.ndim != 4:
             raise ValueError(f"{name} must be 4D, got shape {tuple(image_tensor.shape)}")
         if image_tensor.shape[-1] in [1, 3, 4]:
@@ -310,7 +324,6 @@ class KontextEditModel():
         raise ValueError(f"{name} has unsupported channel layout: {tuple(image_tensor.shape)}")
 
     def _mask_to_blend_tensor(self, mask_tensor: torch.Tensor, blur: bool = True) -> torch.Tensor:
-        # Convert any mask layout to channels-last blend weights (1, H, W, 1).
         mask = mask_tensor.detach().float()
         if mask.ndim == 4:
             mask = mask[0, 0] if mask.shape[1] == 1 else mask[0].max(dim=0).values
@@ -376,7 +389,6 @@ class KontextEditModel():
         return pil
 
     def _apply_black_mask(self, image_tensor: torch.Tensor, binary_mask: torch.Tensor) -> Image.Image:
-        # image_tensor: [1, H, W, 3] in [0,1]; binary_mask: [H, W] or [1, H, W], 1 = region to edit
         if binary_mask.ndim == 3:
             binary_mask = binary_mask[0]
         mask_bool = (binary_mask > 0.5)
@@ -394,47 +406,26 @@ class KontextEditModel():
 
         original_image_tensor = image.clone()
         
-        # CRITICAL FIX: Preserve matted objects when painting with brush
-        # base_mask (total_mask) may contain BOTH matted objects AND brush strokes
-        # add_mask, remove_mask are the paint brush stroke regions (LOW = stroke)
-        # We need to:
-        # 1. Extract ONLY the brush stroke regions (not entire base_mask)
-        # 2. Preserve matted objects outside brush regions
-        # 3. Regenerate only the brush stroke areas
+        add_active = to_active_high_mask(add_mask)
+        remove_active = to_active_high_mask(remove_mask)
+        base_active = to_active_high_mask(base_mask)
         
-        # Identify brush stroke regions (where add_mask or remove_mask have strokes)
-        has_add_stroke = torch.sum(add_mask < 0.5).item() > 0
-        has_remove_stroke = torch.sum(remove_mask < 0.5).item() > 0
+        has_add_stroke = torch.sum(add_active).item() > 0
+        has_remove_stroke = torch.sum(remove_active).item() > 0
         
         if has_add_stroke or has_remove_stroke:
-            # Brush strokes exist: create a mask for ONLY brush stroke regions
-            # Exclude the base_mask (matted object) regions to preserve them
-            brush_only = torch.ones_like(base_mask)
-            if has_add_stroke:
-                brush_only = torch.minimum(brush_only, add_mask)
-            if has_remove_stroke:
-                brush_only = torch.minimum(brush_only, remove_mask)
-            # brush_only now has LOW (<0.5) only where there are brush strokes
-            
-            # The edit region is the brush strokes, not the entire base_mask
-            original_mask = self._expand_mask((brush_only < 0.5).float(), expand=25)
-            
-            # Preserve only matted/base regions that are NOT brush strokes.
-            base_active = (base_mask < 0.5).float()
-            brush_active = (brush_only < 0.5).float()
-            matted_only = torch.clamp(base_active - brush_active, 0.0, 1.0)
+            brush_only = torch.clamp(add_active + remove_active, 0.0, 1.0)
+            original_mask = self._expand_mask(brush_only, expand=25)
+            matted_only = torch.clamp(base_active - brush_only, 0.0, 1.0)
             matted_object_mask = self._expand_mask(matted_only, expand=10)
         else:
-            # No brush strokes, use base_mask as before
-            original_mask = self._expand_mask((base_mask < 0.5).float(), expand=25)
-            matted_object_mask = self._expand_mask((base_mask < 0.5).float(), expand=10)
+            original_mask = self._expand_mask(base_active, expand=25)
+            matted_object_mask = self._expand_mask(base_active, expand=10)
 
         image_pil = self._tensor_to_pil(image)
         control_dict = {}
         lineart_output = None
 
-        # Color brush -> color-block condition; otherwise edge/scribble condition.
-        # Require a meaningful color-layer delta (not just merged-vs-background differences).
         color_delta = (image - colored_image).abs().max().item() if image.shape == colored_image.shape else 1.0
         use_color_control = color_delta > 1e-3 and not torch.equal(image, colored_image)
         if use_color_control:
@@ -461,11 +452,11 @@ class KontextEditModel():
             if lineart_output is None:
                 raise ValueError("Preprocessor failed to generate lineart.")
 
-            # Burn the user's brush strokes into the lineart (strokes are LOW).
-            add_mask_resized = F.interpolate(add_mask.unsqueeze(0).float(), size=(lineart_output.shape[1], lineart_output.shape[2]), mode='nearest').squeeze(0)
-            remove_mask_resized = F.interpolate(remove_mask.unsqueeze(0).float(), size=(lineart_output.shape[1], lineart_output.shape[2]), mode='nearest').squeeze(0)
-            bool_add_stroke = (add_mask_resized < 0.5)
-            bool_remove_stroke = (remove_mask_resized < 0.5)
+            # Map the active-high strokes back to the lineart conditioning image correctly
+            add_mask_resized = F.interpolate(add_active.unsqueeze(0).float(), size=(lineart_output.shape[1], lineart_output.shape[2]), mode='nearest').squeeze(0)
+            remove_mask_resized = F.interpolate(remove_active.unsqueeze(0).float(), size=(lineart_output.shape[1], lineart_output.shape[2]), mode='nearest').squeeze(0)
+            bool_add_stroke = (add_mask_resized > 0.5)
+            bool_remove_stroke = (remove_mask_resized > 0.5)
             lineart_output[bool_remove_stroke] = 0.0
             lineart_output[bool_add_stroke] = 1.0
 
@@ -494,9 +485,6 @@ class KontextEditModel():
 
         final_image = self._pil_to_tensor(result_pil)
         
-        # CRITICAL FIX: Composite with matted objects to preserve them
-        # If we have matted objects, blend the generated result back using the matted object mask
-        # This ensures matted objects are restored where they should be preserved
         if matted_object_mask is not None and torch.sum(matted_object_mask > 0.5).item() > 0:
             final_image = self._composite_preserve_mask(
                 final_image, original_image_tensor, matted_object_mask, "matted objects"
@@ -513,7 +501,8 @@ class KontextEditModel():
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         original_image_tensor = image.clone()
-        original_mask = self._expand_mask((remove_mask < 0.5).float(), expand=10)
+        remove_active = to_active_high_mask(remove_mask)
+        original_mask = self._expand_mask(remove_active, expand=10)
 
         image_pil = self._tensor_to_pil(image)
         spatial_pil = self._apply_black_mask(image, original_mask)
@@ -539,22 +528,14 @@ class KontextEditModel():
 
         final_image = self._pil_to_tensor(result_pil)
         
-        # Apply smooth blending to preserve boundary quality
-        # Blur the mask for anti-aliasing at the boundary between generated and original
         try:
             original_mask_pil = self._tensor_to_pil(original_mask)
             original_mask_np = np.array(original_mask_pil)
-            if original_mask_np.ndim == 3:  # Handle RGB/RGBA
+            if original_mask_np.ndim == 3:
                 original_mask_np = original_mask_np[:, :, 0]
             blurred_mask = cv2.GaussianBlur(original_mask_np, (11, 11), 3.0)
-            # _pil_to_tensor returns (1, H, W, C), so use (1, H, W, 1) for blend mask
             blend_mask_smooth = torch.from_numpy(blurred_mask / 255.0).float().unsqueeze(0).unsqueeze(-1)
-            
-            # Ensure original image is channels-last for blending
             original_blend = self._ensure_channels_last(original_image_tensor, "original_image_tensor")
-            
-            # original_mask marks the edited region (high inside edited area),
-            # so keep generated pixels where mask is high, preserve original outside.
             final_image = final_image * blend_mask_smooth + original_blend * (1.0 - blend_mask_smooth)
             print("[OK] Object removal with smooth blending")
         except Exception as e:
@@ -567,52 +548,81 @@ class KontextEditModel():
                    seed, steps, cfg, preserve_mask=None):
         generator = torch.Generator(device=self.device).manual_seed(seed)
         original_image_tensor = image.clone()
-        original_mask = self._expand_mask((fill_mask < 0.5).float(), expand=10)
-        image_pil = self._tensor_to_pil(image)
+        # Safety clamp: local_edit must never run more than 18 steps
+        # (the fill-brush path locks to 18 below, but this catches direct calls)
+        steps = min(steps, 18)
+        
+        fill_active = to_active_high_mask(fill_mask)
+        has_fill_stroke = torch.sum(fill_active > 0.5).item() > 0
+        
+        if has_fill_stroke:
+            steps = 18  # Lock step execution counter down
+            
+        original_mask = self._expand_mask(fill_active, expand=10)
+        
+        # VERY IMPORTANT: Ensure mask matches pipeline active-high layout convention
+        generation_mask = original_mask.clone()
+        
+        # Replace whiteout with Gaussian noise: Flux Kontext flow-matching treats
+        # flat white latents as a boundary condition to PRESERVE, not overwrite.
+        # Seeding the brushed region with random noise forces the model to generate.
+        img = image.clone()
 
-        spatial_pil = self._apply_black_mask(image, original_mask)
+        # ── Alpha-composite guard ──────────────────────────────────────────────
+        # When a prop sticker was pasted, the canvas tensor may still carry RGBA
+        # data (4 channels) or have zero-valued pixels where the transparency
+        # checkerboard sat. Composite those pixels against the background NOW,
+        # before noise-seeding, so the VAE never sees raw transparency values.
+        if img.shape[0] == 4:  # RGBA canvas
+            alpha_ch = img[3:4].clamp(0.0, 1.0)
+            img = img[:3] * alpha_ch + original_image_tensor[:3] * (1.0 - alpha_ch)
+        elif img.shape[-1] == 4:  # channels-last RGBA
+            alpha_ch = img[..., 3:4].clamp(0.0, 1.0)
+            img = img[..., :3] * alpha_ch + original_image_tensor[..., :3] * (1.0 - alpha_ch)
+        # ──────────────────────────────────────────────────────────────────────
+
+        fill_hi = fill_active.squeeze(0) if fill_active.ndim == 3 else fill_active
+        brush_mask_3 = (fill_hi > 0.5).unsqueeze(0).expand(img.shape[0], -1, -1)
+        noise_pixels = torch.randn_like(img, generator=torch.Generator(device=img.device).manual_seed(seed))
+        img = torch.where(brush_mask_3, noise_pixels, img)
+        image_pil = self._tensor_to_pil(img)
+        
+        # local LoRA conditioning: blackout background, keep stroke area intact
+        bg_mask = 1.0 - original_mask
+        spatial_pil = self._apply_black_mask(image, bg_mask)
+        
         control_dict = {
             "type": "local",
             "spatial_images": [spatial_pil],
             "gammas": [local_strength],
         }
-
         result_pil = self.pipe(
             prompt=positive_prompt,
             image=image_pil,
-            mask_image=original_mask,
+            mask_image=generation_mask,
             height=self.pipe.fit_kontext_resolution(image_pil)[1],
             width=self.pipe.fit_kontext_resolution(image_pil)[0],
             guidance_scale=cfg,
-            num_inference_steps=steps,
+            num_inference_steps=steps, # This is safely set to 18 above
             generator=generator,
             max_sequence_length=512,
             control_dict=control_dict,
         ).images[0]
         self.clear_cache()
-
         final_image = self._pil_to_tensor(result_pil)
         
-        # Apply smooth blending to preserve boundary quality
         try:
             original_mask_pil = self._tensor_to_pil(original_mask)
             original_mask_np = np.array(original_mask_pil)
-            if original_mask_np.ndim == 3:  # Handle RGB/RGBA
+            if original_mask_np.ndim == 3:
                 original_mask_np = original_mask_np[:, :, 0]
             blurred_mask = cv2.GaussianBlur(original_mask_np, (11, 11), 3.0)
-            # _pil_to_tensor returns (1, H, W, C), so use (1, H, W, 1) for blend mask
             blend_mask_smooth = torch.from_numpy(blurred_mask / 255.0).float().unsqueeze(0).unsqueeze(-1)
-            
-            # Ensure original image is channels-last for blending
             original_blend = self._ensure_channels_last(original_image_tensor, "original_image_tensor")
-            
-            # original_mask marks the edited region (high inside edited area),
-            # so keep generated pixels where mask is high, preserve original outside.
             final_image = final_image * blend_mask_smooth + original_blend * (1.0 - blend_mask_smooth)
             print("[OK] Local edit with smooth blending")
         except Exception as e:
             print(f"[WARN] Smooth blending failed ({e}), using generated result directly")
-
         if preserve_mask is not None:
             final_image = self._composite_preserve_mask(
                 final_image, original_image_tensor, preserve_mask, "matted objects"
@@ -620,92 +630,7 @@ class KontextEditModel():
         
         return (final_image, self._pil_to_tensor(spatial_pil), original_mask)
 
-    def foreground_edit(self,
-                        merged_image, positive_prompt,
-                        add_prop_mask, fill_mask, total_mask, fix_perspective, grow_size,
-                        seed, steps, cfg):
-        generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # app.py no longer prepends the foreground instruction, so build it here.
-        positive_prompt = (
-            "Fill in the white region naturally and adapt the foreground into the background. "
-            "Preserve existing matted/pasted characters and objects outside the edited brush region. "
-            + positive_prompt
-        )
-        if fix_perspective == "enable":
-            positive_prompt = positive_prompt + " Fix the perspective if necessary."
-
-        merged_original = self._ensure_channels_last(merged_image.clone(), "merged_image")
-
-        # Convert brush masks to stroke-high so we can reuse the original logic.
-        prop_hi = (add_prop_mask < 0.5).float()
-        fill_hi = (fill_mask < 0.5).float()
-        has_fill_stroke = torch.sum(fill_hi > 0.5).item() > 0
-
-        self._debug_dump("01_add_prop_mask", add_prop_mask)
-        self._debug_dump("02_fill_mask", fill_mask)
-        self._debug_dump("03_total_mask", total_mask)
-        self._debug_dump("04_prop_hi", prop_hi)
-        self._debug_dump("05_merged_input", merged_original)
-
-        if has_fill_stroke:
-            # Magic-quill fill brush: only regenerate the brushed fill region.
-            edit_mask = self._expand_mask(fill_hi, expand=25)
-            white_region = fill_hi > 0.5
-        else:
-            # Prop integration: white halo around pasted props for backdrop fill.
-            edit_mask = torch.clamp(self._expand_mask(prop_hi, expand=grow_size), 0.0, 1.0)
-            white_region = ((prop_hi <= 0.5) & (edit_mask > 0.5)).squeeze(0)
-
-        # Paint white only in regions that should be regenerated (never on matted props).
-        img = merged_original.clone()
-        if white_region.ndim == 3:
-            white_region = white_region.squeeze(0)
-        white_3 = white_region.unsqueeze(-1).expand(-1, -1, img.shape[-1])
-        img[0] = torch.where(white_3, torch.ones_like(img[0]), img[0])
-
-        self._debug_dump("06_edit_mask", edit_mask)
-        self._debug_dump("07_white_region", white_region.float())
-        self._debug_dump("08_whited_input", img)
-
-        image_pil = self._tensor_to_pil(img)
-
-        self._enable_aux_lora()
-        try:
-            result_pil = self.pipe(
-                prompt=positive_prompt,
-                image=image_pil,
-                mask_image=edit_mask,
-                height=self.pipe.fit_kontext_resolution(image_pil)[1],
-                width=self.pipe.fit_kontext_resolution(image_pil)[0],
-                guidance_scale=cfg,
-                num_inference_steps=steps,
-                generator=generator,
-                max_sequence_length=512,
-                control_dict=None,
-            ).images[0]
-        finally:
-            self._disable_aux_lora()
-        self.clear_cache()
-
-        final_image = self._pil_to_tensor(result_pil)
-        
-        # Blend generated content into edit region, then hard-lock matted props back in.
-        try:
-            edit_blend = self._mask_to_blend_tensor(edit_mask)
-            final_image = self._ensure_channels_last(final_image, "final_image")
-            final_image = final_image * edit_blend + merged_original * (1.0 - edit_blend)
-            final_image = self._composite_preserve_mask(
-                final_image, merged_original, self._expand_mask(prop_hi, expand=3), "matted props"
-            )
-            print("[OK] Foreground edit with matted preservation")
-        except Exception as e:
-            print(f"[WARN] Smooth blending failed ({e}), using generated result directly")
-            final_image = self._composite_preserve_mask(
-                final_image, merged_original, prop_hi, "matted props (fallback)"
-            )
-        
-        return (final_image, self._pil_to_tensor(image_pil), edit_mask)
 
     def kontext_edit(self,
                      image, positive_prompt,
@@ -735,17 +660,35 @@ class KontextEditModel():
                 total_mask, add_mask, remove_mask, add_prop_mask, fill_mask,
                 fine_edge, fix_perspective, edge_strength, color_strength, local_strength, grow_size,
                 seed, steps, cfg, flag="precise_edit"):
-        # Force num_inference_steps to a hardcoded range of 17-18 steps
-        steps = min(max(steps, 17), 18)
-        if flag == "foreground":
-            return self.foreground_edit(merged_image, positive_prompt, add_prop_mask, fill_mask, total_mask, fix_perspective, grow_size, seed, steps, cfg)
-        elif flag == "local":
-            preserve_mask = None
-            if torch.sum(add_prop_mask < 0.5).item() > 0:
-                preserve_mask = self._expand_mask((add_prop_mask < 0.5).float(), expand=3)
+        # Hard cap: fill/foreground brush paths must never exceed 18 inference steps.
+        if flag in ("foreground", "local"):
+            steps = min(steps, 18)
+            # Build the combined fill mask.
+            # For "foreground" (prop sticker + fill strokes), use total_mask as the
+            # generation target — it marks everything the frontend painted, including
+            # the transparent (checkerboard) zone under the prop.
+            # Use merged_image (prop composited over background) so the VAE receives
+            # clean pixels — not raw transparency channels.
+            if flag == "foreground":
+                # Derive the effective fill mask: total_mask covers the whole edit zone
+                # (prop body + transparent hole + any fill strokes the user painted).
+                # This replaces the broken foreground_edit custom path entirely.
+                effective_fill_mask = total_mask
+                canvas_image = merged_image   # clean, alpha-composited canvas
+                print(f"[ROUTING] foreground → local_edit | total_mask as fill, merged_image as canvas")
+            else:
+                effective_fill_mask = fill_mask
+                canvas_image = image
+                print(f"[ROUTING] local → local_edit | fill_mask, original image")
+
+            # Diagnostic: confirm the effective mask has live pixels.
+            fill_active_check = to_active_high_mask(effective_fill_mask)
+            print(f"[DIAGNOSTIC] effective_fill_mask sum: {torch.sum(fill_active_check > 0.5).item()}")
+
             return self.local_edit(
-                image, positive_prompt, fill_mask, local_strength, seed, steps, cfg,
-                preserve_mask=preserve_mask,
+                canvas_image, positive_prompt, effective_fill_mask, local_strength,
+                seed, steps, cfg,
+                preserve_mask=None,
             )
         elif flag == "removal":
             return self.object_removal(image, positive_prompt, remove_mask, local_strength, seed, steps, cfg)
@@ -768,7 +711,6 @@ class SAM():
         self.join_alpha = JoinImageWithAlpha()
         self.invert_mask = InvertMask()
         self.predictor = None
-        # Initialize immediately with default or ask user to call load_model
         self.load_model()
 
     def load_model(self, model_type='vit_b', checkpoint_path=None, device='cpu'):
@@ -776,8 +718,6 @@ class SAM():
             current_dir = os.path.dirname(os.path.abspath(__file__))
             checkpoint_path = os.path.join(current_dir, 'models', 'sam', 'sam_vit_b_01ec64.pth')
             
-        # You need to download the checkpoint manually: 
-        # https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
         if not os.path.exists(checkpoint_path):
             print(f"Warning: SAM Checkpoint not found at {checkpoint_path}. Please download it.")
             return
@@ -814,35 +754,29 @@ class SAM():
             if self.predictor is None:
                 raise RuntimeError("SAM model not loaded.")
 
-        # Prepare image for SAM (numpy uint8)
-        # image tensor is [1, H, W, 3] float 0-1
         image_np = (image.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
         self.predictor.set_image(image_np)
 
         input_point = []
         input_label = []
         
-        # Process points
         if coordinates_positive:
             coords = json.loads(coordinates_positive) if isinstance(coordinates_positive, str) else coordinates_positive
             for p in coords:
                 input_point.append([p['x'], p['y']])
-                input_label.append(1) # 1 = foreground
+                input_label.append(1)
                 
         if coordinates_negative:
             coords = json.loads(coordinates_negative) if isinstance(coordinates_negative, str) else coordinates_negative
             for p in coords:
                 input_point.append([p['x'], p['y']])
-                input_label.append(0) # 0 = background
+                input_label.append(0)
 
-        # Process bbox
         input_box = None
         if bboxes:
-            
             box_list = []
             for box in bboxes:
                 box_list.append(list(box))
-            
             if len(box_list) > 0:
                 input_box = np.array(box_list)
 
@@ -853,8 +787,6 @@ class SAM():
             input_point = None
             input_label = None
 
-        # Predict
-        # We use multimask_output=False to get single best mask
         masks, scores, logits = self.predictor.predict(
             point_coords=input_point,
             point_labels=input_label,
@@ -862,10 +794,7 @@ class SAM():
             multimask_output=False,
         )
         
-        # masks: [1, H, W]
         mask_np = masks[0]
-        
-        # Convert back to tensor [1, H, W]
         mask = torch.from_numpy(mask_np).float().unsqueeze(0)
         
         invert_mask = self.invert_mask.invert(mask)[0]

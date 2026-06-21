@@ -2,6 +2,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import sys
+import numpy as np
 import logging
 class LoraWarningFilter(logging.Filter):
     def filter(self, record):
@@ -71,10 +72,26 @@ def generate(merged_image, total_mask, original_image, add_color_image, add_edge
     else:
         add_color_image_tensor = original_image_tensor
         
-    add_mask = create_alpha_mask(read_base64_image_utils(add_edge_mask)) if add_edge_mask else torch.ones_like(total_mask_tensor) 
+    add_mask = create_alpha_mask(read_base64_image_utils(add_edge_mask)) if add_edge_mask else torch.ones_like(total_mask_tensor)
     remove_mask = create_alpha_mask(read_base64_image_utils(remove_edge_mask)) if remove_edge_mask else torch.ones_like(total_mask_tensor)
-    add_prop_mask = create_alpha_mask(read_base64_image_utils(add_prop_image)) if add_prop_image else torch.ones_like(total_mask_tensor)
     fill_mask_tensor = create_alpha_mask(read_base64_image_utils(fill_mask)) if fill_mask else torch.ones_like(total_mask_tensor)
+
+    # Build add_prop_mask from the prop image alpha channel.
+    # create_alpha_mask gives active-low convention: 0.0 = inside prop, 1.0 = outside.
+    # When add_prop_image is a solid (non-transparent) image, alpha=255 everywhere,
+    # so create_alpha_mask returns all-zeros ("entire image is prop").
+    # We use total_mask_tensor as a proxy in that case, which reflects what the
+    # frontend actually painted.
+    if add_prop_image:
+        raw_prop_mask = create_alpha_mask(read_base64_image_utils(add_prop_image))
+        # If the mask is entirely zero (solid prop image), fall back to total_mask
+        if torch.sum(raw_prop_mask > 0.5).item() == 0:
+            add_prop_mask = total_mask_tensor
+            print("[INFO] Prop image has no transparent areas — using total_mask as prop_mask")
+        else:
+            add_prop_mask = raw_prop_mask
+    else:
+        add_prop_mask = torch.ones_like(total_mask_tensor)
 
     # Clean the checkered brush pattern in the merged canvas
     # by reconstructing the canvas (combining original background with clean pasted props)
@@ -84,7 +101,9 @@ def generate(merged_image, total_mask, original_image, add_color_image, add_edge
             prop_pil = Image.open(read_base64_image_utils(add_prop_image)).convert("RGBA")
             prop_alpha_np = np.array(prop_pil.getchannel('A')).astype(np.float32) / 255.0
             prop_alpha = torch.from_numpy(prop_alpha_np).to(device=original_image_tensor.device, dtype=original_image_tensor.dtype)[None, ..., None]
-            prop_rgb = load_and_preprocess_image(read_base64_image_utils(add_prop_image)).to(device=original_image_tensor.device, dtype=original_image_tensor.dtype)
+            # Load prop RGB without compositing onto white — preserve the clean pixel values.
+            prop_rgb_np = np.array(prop_pil.convert("RGB")).astype(np.float32) / 255.0
+            prop_rgb = torch.from_numpy(prop_rgb_np)[None, ...].to(device=original_image_tensor.device, dtype=original_image_tensor.dtype)
             
             merged_image_tensor = prop_rgb * prop_alpha + original_image_tensor * (1.0 - prop_alpha)
             print("[OK] Reconstructed clean merged canvas with props (no checkers)")
@@ -96,9 +115,42 @@ def generate(merged_image, total_mask, original_image, add_color_image, add_edge
     if torch.sum(extra_active > 0.5).item() > 0:
         add_mask = torch.minimum(add_mask, 1.0 - extra_active)
 
-    has_prop = torch.sum(add_prop_mask < 0.5).item() > 0
-    has_brush = torch.sum(add_mask < 0.5).item() > 0 or torch.sum(remove_mask < 0.5).item() > 0
-    has_fill = torch.sum(fill_mask_tensor < 0.5).item() > 0
+    # ── Detect which brushes the user actually drew ──────────────────────────
+    # create_alpha_mask uses active-LOW convention:
+    #   0.0 = stroke drawn here (inside the brush mark)
+    #   1.0 = empty / background
+    # A completely un-stroked mask layer is ALL 1.0 from the frontend.
+    # "sum < 0.5" on an all-1.0 tensor = 0 → correctly says "no strokes".
+    # "sum < 0.5" on an all-0.0 tensor = total pixels → WRONG (create_alpha_mask
+    # returns all-zeros when the prop PNG has no transparent pixels, or when
+    # the edge mask is all-white). We must check for values actually below 0.5
+    # only when there are meaningful strokes, not when the whole layer is zeroed.
+    #
+    # Robust check: a mask has real strokes only if it has BOTH pixels < 0.5
+    # (stroke) AND pixels >= 0.5 (non-stroke) — i.e. it is not uniform.
+    def _has_strokes(mask_tensor: torch.Tensor) -> bool:
+        """Return True only if the mask contains real user-drawn strokes.
+        An all-zeros OR all-ones mask means the layer is empty."""
+        low  = torch.sum(mask_tensor < 0.1).item()   # stroke pixels
+        high = torch.sum(mask_tensor > 0.9).item()   # background pixels
+        total = mask_tensor.numel()
+        # Require at least 0.5% stroke coverage AND the mask is not uniform
+        return low > (total * 0.005) and high > 0
+
+    has_prop  = _has_strokes(add_prop_mask)
+    has_brush = _has_strokes(add_mask) or _has_strokes(remove_mask)
+    has_fill  = _has_strokes(fill_mask_tensor)
+
+    print(
+        "[ROUTING] stroke detection:",
+        f"has_prop={has_prop}",
+        f"has_brush={has_brush}",
+        f"has_fill={has_fill}",
+        f"add_mask_low={torch.sum(add_mask < 0.1).item()}",
+        f"remove_mask_low={torch.sum(remove_mask < 0.1).item()}",
+        f"fill_mask_low={torch.sum(fill_mask_tensor < 0.1).item()}",
+        f"prop_mask_low={torch.sum(add_prop_mask < 0.1).item()}",
+    )
 
     edit_image_tensor = original_image_tensor
 
@@ -112,13 +164,17 @@ def generate(merged_image, total_mask, original_image, add_color_image, add_edge
             # Keep edge control for matte+brush edits; background-only color layer confuses color LoRA.
             add_color_image_tensor = merged_image_tensor
     elif has_fill:
-        # Fill brush (checkered inpaint region): local edit on merged canvas when mattes exist.
-        flag = "local"
+        # Fill brush: both fill-only and fill+prop go through local_edit().
+        # For fill+prop, pass merged_image (clean composite) as the canvas;
+        # process() will use total_mask so the transparent zone is included.
         if has_prop:
+            flag = "foreground"   # process() routes both to local_edit
             edit_image_tensor = merged_image_tensor
+        else:
+            flag = "local"
     elif has_prop:
-        flag = "foreground"
-        # Note: foreground_edit builds its own prompt internally
+        flag = "foreground"   # process() routes to local_edit with total_mask
+        edit_image_tensor = merged_image_tensor
     elif (torch.sum(remove_mask < 0.5).item() > 0 and torch.sum(add_mask < 0.5).item() == 0):
         positive_prompt = "remove the instance"
         flag = "removal"
