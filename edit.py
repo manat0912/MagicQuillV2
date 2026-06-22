@@ -670,20 +670,30 @@ class KontextEditModel():
             # Use merged_image (prop composited over background) so the VAE receives
             # clean pixels — not raw transparency channels.
             if flag == "foreground":
-                # Derive the effective fill mask: total_mask covers the whole edit zone
-                # (prop body + transparent hole + any fill strokes the user painted).
-                # This replaces the broken foreground_edit custom path entirely.
-                effective_fill_mask = total_mask
+                # Use the user's fill brush strokes as the generation target.
+                # total_mask covers the ENTIRE prop bounding box (body + hole) which
+                # causes local_edit to mask the whole scene → black silhouette output.
+                # fill_mask targets only the pixels the user explicitly brushed,
+                # which is exactly the transparent / checkerboard area to fill.
+                fill_active_check = to_active_high_mask(fill_mask)
+                fill_has_pixels = torch.sum(fill_active_check > 0.5).item() > 0
+                if fill_has_pixels:
+                    effective_fill_mask = fill_mask
+                    print(f"[ROUTING] foreground → local_edit | fill_mask ({int(torch.sum(fill_active_check>0.5).item())} px), merged canvas")
+                else:
+                    # No fill strokes — prop-only paste; use total_mask so the
+                    # transparent checkerboard zone gets noise-seeded.
+                    effective_fill_mask = total_mask
+                    print(f"[ROUTING] foreground → local_edit | total_mask (no fill strokes), merged canvas")
                 canvas_image = merged_image   # clean, alpha-composited canvas
-                print(f"[ROUTING] foreground → local_edit | total_mask as fill, merged_image as canvas")
             else:
                 effective_fill_mask = fill_mask
                 canvas_image = image
                 print(f"[ROUTING] local → local_edit | fill_mask, original image")
 
             # Diagnostic: confirm the effective mask has live pixels.
-            fill_active_check = to_active_high_mask(effective_fill_mask)
-            print(f"[DIAGNOSTIC] effective_fill_mask sum: {torch.sum(fill_active_check > 0.5).item()}")
+            fill_active_check2 = to_active_high_mask(effective_fill_mask)
+            print(f"[DIAGNOSTIC] effective_fill_mask sum: {torch.sum(fill_active_check2 > 0.5).item()}")
 
             return self.local_edit(
                 canvas_image, positive_prompt, effective_fill_mask, local_strength,

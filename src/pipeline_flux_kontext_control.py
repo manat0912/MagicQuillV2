@@ -1179,32 +1179,33 @@ class FluxKontextControlPipeline(
                     if torch.backends.mps.is_available():
                         latents = latents.to(latents_dtype)
 
-                # Step-by-step latent blending for inpainting
-                if mask_packed is not None and image_latents is not None:
-                    # Cast image_latents, initial_noise, and mask_packed to match latents' device and dtype
-                    image_latents = image_latents.to(device=latents.device, dtype=latents.dtype)
-                    initial_noise = initial_noise.to(device=latents.device, dtype=latents.dtype)
-                    mask_packed = mask_packed.to(device=latents.device, dtype=latents.dtype)
-                    
-                    # --- ADD THIS SHAPE PROTECTION FOR PACKED FLUX LATENTS ---
-                    if image_latents.shape != latents.shape:
-                        image_latents = image_latents.expand_as(latents)
-                    if initial_noise.shape != latents.shape:
-                        initial_noise = initial_noise.expand_as(latents)
-                    # --------------------------------------------------------
-                    
+                # Step-by-step latent blending for inpainting.
+                # GUARD: only run if mask_packed is 1-channel per token and
+                # dimensions are compatible with latents.  The Kontext reference
+                # image is concatenated onto image_latents BEFORE this loop, so
+                # image_latents.shape[1] is 2x latents.shape[1] for precise_edit.
+                # We must NOT run the blending on that concatenated tensor.
+                if (
+                    mask_packed is not None
+                    and image_latents is not None
+                    and image_latents.shape[1] == latents.shape[1]  # same sequence length
+                ):
+                    # Cast to match latents
+                    _img_lat = image_latents.to(device=latents.device, dtype=latents.dtype)
+                    _ini_noi = initial_noise.to(device=latents.device, dtype=latents.dtype)
+                    _msk_pak = mask_packed.to(device=latents.device, dtype=latents.dtype)
+
                     if i < len(timesteps) - 1:
                         next_t = timesteps[i + 1]
                         normalized_t = (next_t / 1000.0).to(device=latents.device, dtype=latents.dtype)
-                        noisy_image_latents = (1.0 - normalized_t) * image_latents + normalized_t * initial_noise
+                        noisy_image_latents = (1.0 - normalized_t) * _img_lat + normalized_t * _ini_noi
                     else:
-                        noisy_image_latents = image_latents
-                        
-                    # Handle dimension matching for channel-packed Flux latents
-                    if mask_packed.shape != latents.shape:
-                        mask_packed = mask_packed.expand_as(latents)
-                        
-                    latents = torch.where(mask_packed > 0.5, latents, noisy_image_latents)
+                        noisy_image_latents = _img_lat
+
+                    if _msk_pak.shape != latents.shape:
+                        _msk_pak = _msk_pak.expand_as(latents)
+
+                    latents = torch.where(_msk_pak > 0.5, latents, noisy_image_latents)
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
