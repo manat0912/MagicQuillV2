@@ -15,36 +15,21 @@ class LoraWarningFilter(logging.Filter):
 logging.getLogger("diffusers.loaders.peft").addFilter(LoraWarningFilter())
 logging.getLogger("diffusers.loaders.lora_base").addFilter(LoraWarningFilter())
 
-import tempfile
-from safetensors.torch import load_file, save_file
-
-# Make `src` and `train` importable regardless of the current working directory.
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
-sys.path.append(os.path.abspath(os.path.join(current_dir, '..')))
-sys.path.append(os.path.abspath(os.path.join(current_dir, '..', '..', 'comfy_extras')))
-
-# MagicQuill V2's own EasyControl engine (custom pipeline + transformer).
+# ── Pipeline + GGUF transformer imports ───────────────────────────────────────
 from src.pipeline_flux_kontext_control import FluxKontextControlPipeline
-from src.transformer_flux import FluxTransformer2DModel
-from diffusers import AutoencoderKL, GGUFQuantizationConfig
 
-# Allow the GGUF single-file loader to recognise the custom transformer class
-# (it shares the name "FluxTransformer2DModel" with the diffusers class).
-import diffusers.loaders.single_file_model as sfm
-_orig_get_single_file_loadable_mapping_class = sfm._get_single_file_loadable_mapping_class
-def _patched_get_single_file_loadable_mapping_class(cls):
-    if cls.__name__ == "FluxTransformer2DModel":
-        return "FluxTransformer2DModel"
-    return _orig_get_single_file_loadable_mapping_class(cls)
-sfm._get_single_file_loadable_mapping_class = _patched_get_single_file_loadable_mapping_class
-print("[OK] Monkey patch applied to diffusers._get_single_file_loadable_mapping_class")
+# diffusers GGUF loader (requires diffusers >= 0.32 + gguf extra)
+from diffusers import AutoencoderKL
+from diffusers import FluxTransformer2DModel
+from diffusers.quantizers.gguf.utils import GGUFQuantizationConfig
+from safetensors.torch import load_file
+import tempfile
 
-# Auto-convert mixed-format LoRA checkpoints (PEFT -> diffusers) and add the
-# `transformer.` prefix so the aux puzzle LoRA loads onto the custom pipeline.
+# ── LoRA key-format monkey-patch (converts PEFT → diffusers keys on the fly) ──
 _original_load_lora_weights = FluxKontextControlPipeline.load_lora_weights
 
 def _patched_load_lora_weights(self, pretrained_model_name_or_path_or_dict, **kwargs):
+    """Auto-convert mixed-format LoRAs and add transformer prefix."""
     weight_name = kwargs.get("weight_name", "pytorch_lora_weights.safetensors")
 
     if isinstance(pretrained_model_name_or_path_or_dict, str):
@@ -56,11 +41,13 @@ def _patched_load_lora_weights(self, pretrained_model_name_or_path_or_dict, **kw
         if os.path.exists(lora_file):
             state_dict = load_file(lora_file)
 
-            needs_format_conversion = any('lora_A.weight' in k or 'lora_B.weight' in k for k in state_dict.keys())
+            needs_format_conversion = any(
+                'lora_A.weight' in k or 'lora_B.weight' in k for k in state_dict.keys()
+            )
             needs_prefix = not any(k.startswith('transformer.') for k in state_dict.keys())
 
             if needs_format_conversion or needs_prefix:
-                print(f"[LoRA] Processing LoRA: {lora_file}")
+                print(f"Processing LoRA: {lora_file}")
                 converted_state = {}
                 for key, value in state_dict.items():
                     new_key = key
@@ -71,19 +58,23 @@ def _patched_load_lora_weights(self, pretrained_model_name_or_path_or_dict, **kw
                     if not new_key.startswith('transformer.'):
                         new_key = f'transformer.{new_key}'
                     converted_state[new_key] = value
-
-                print(f"   [OK] Total keys: {len(converted_state)}")
+                print(f"  Total keys: {len(converted_state)}")
                 with tempfile.TemporaryDirectory() as temp_dir:
+                    from safetensors.torch import save_file
                     temp_file = os.path.join(temp_dir, weight_name)
                     save_file(converted_state, temp_file)
                     return _original_load_lora_weights(self, temp_dir, **kwargs)
             else:
-                print(f"[OK] LoRA already in correct format: {lora_file}")
+                print(f"LoRA already in correct format: {lora_file}")
 
     return _original_load_lora_weights(self, pretrained_model_name_or_path_or_dict, **kwargs)
 
 FluxKontextControlPipeline.load_lora_weights = _patched_load_lora_weights
 print("[OK] Monkey patch applied to FluxKontextControlPipeline.load_lora_weights")
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+sys.path.append(os.path.abspath(os.path.join(current_dir, '..')))
 
 from train.src.condition.edge_extraction import InformativeDetector, HEDDetector
 from utils_node import BlendInpaint, JoinImageWithAlpha, GrowMask, InvertMask, ColorDetector
@@ -93,113 +84,116 @@ TEST_MODE = False
 
 
 def to_active_high_mask(mask_tensor: torch.Tensor) -> torch.Tensor:
+    """Convert active-low frontend mask (0=stroke, 1=bg) → active-high (1=stroke)."""
     if mask_tensor is None:
         return torch.zeros((1, 512, 512), dtype=torch.float32)
-    
-    # Strip any singleton channel axes to check data shape accurately
     flat_mask = mask_tensor.clone().detach()
-    
-    # Frontend passes 0.0 for brush strokes and 1.0 for background (active-low).
-    # If there are zero pixels below 0.1, nothing was brushed -> return empty mask.
+    # If no pixels are below 0.1, the layer is completely empty.
     if torch.sum(flat_mask < 0.1).item() == 0:
         return torch.zeros_like(mask_tensor)
-        
-    # Active-low (0.0 inside stroke, 1.0 outside) -> Active-high conversion
-    # Explicitly marks the brush stroke zone for the transformer loop.
     return (flat_mask < 0.5).float()
 
 
 class KontextEditModel():
     """
-    MagicQuill V2 editing engine, loaded for low (≈12 GB) VRAM:
-      - transformer: GGUF-quantised FLUX.1-Kontext-dev (resident on GPU)
-      - text_encoder (CLIP-L): GPU
-      - text_encoder_2 (T5-XXL): FP8, kept on CPU
-      - vae: offloaded to CPU between encode/decode by the pipeline
-      - EasyControl task LoRAs (edge / color / local / removal) + aux puzzle LoRA
+    MagicQuill V2 editing engine — GGUF fast-load variant.
+
+    Components loaded:
+      - CLIP-L text encoder          (GPU, bf16)
+      - T5-XXL text encoder          (CPU, FP8-quantised)
+      - VAE ae.safetensors           (CPU, offloaded between encode/decode)
+      - flux1-kontext-dev Q5_K_M     (GPU, GGUF bf16 compute)
+      - EasyControl task LoRAs       (edge / color / local / removal)
+      - Aux puzzle LoRA              (optional, for prop/foreground mode)
     """
 
-    def __init__(self, base_model_path="HelloTestUser/FLUX.1-Kontext-dev", device="cuda",
-                 aux_lora_dir=None, easycontrol_base_dir=None,
+    def __init__(self,
+                 # HF repo used ONLY for scheduler + tokenizer configs (no weights downloaded).
+                 base_model_path="HelloTestUser/FLUX.1-Kontext-dev",
+                 device="cuda",
+                 aux_lora_dir=None,
+                 easycontrol_base_dir=None,
                  aux_lora_weight_name="puzzle_lora.safetensors",
                  aux_lora_weight=1.0):
-        current_dir = os.path.dirname(os.path.abspath(__file__))
+
         if aux_lora_dir is None:
             aux_lora_dir = os.path.join(current_dir, "models", "v2_ckpt")
         if easycontrol_base_dir is None:
             easycontrol_base_dir = os.path.join(current_dir, "models", "v2_ckpt")
 
-        # Preprocessors (used to build the spatial control conditions).
-        self.mask_processor = GrowMask()
+        self.mask_processor  = GrowMask()
         self.scribble_processor = HEDDetector.from_pretrained()
-        self.lineart_processor = InformativeDetector.from_pretrained()
-        self.color_processor = ColorDetector()
-        self.blender = BlendInpaint()
-
+        self.lineart_processor  = InformativeDetector.from_pretrained()
+        self.color_processor    = ColorDetector()
+        self.blender            = BlendInpaint()
         self.device = device
 
         import gc
         from transformers import CLIPTextModel, CLIPTextConfig, T5EncoderModel, T5Config
         from optimum.quanto import quantize, qfloat8, freeze
 
-        # 1. CLIP text encoder (~246MB) on GPU.
+        # ── 1. CLIP text encoder (~246 MB) ────────────────────────────────────
         print("Loading CLIP text encoder...")
-        clip_config = CLIPTextConfig.from_pretrained(base_model_path, subfolder="text_encoder", token=False)
+        clip_config = CLIPTextConfig.from_pretrained(
+            base_model_path, subfolder="text_encoder", token=False
+        )
         text_encoder = CLIPTextModel(clip_config).to(device="cpu", dtype=torch.bfloat16)
-        clip_path = os.path.join(current_dir, "models", "v2_ckpt", "split_files", "text_encoders", "clip_l.safetensors")
+        clip_path = os.path.join(
+            current_dir, "models", "v2_ckpt", "split_files",
+            "text_encoders", "clip_l.safetensors"
+        )
         clip_state_dict = load_file(clip_path)
 
-        def load_text_encoder_state_dict(model, state_dict):
+        def _load_clip(model, sd):
             model_keys = set(model.state_dict().keys())
-            if set(state_dict.keys()) == model_keys:
-                model.load_state_dict(state_dict)
+            if set(sd.keys()) == model_keys:
+                model.load_state_dict(sd)
                 return
             new_sd = {}
-            for k, v in state_dict.items():
-                new_key = k
+            for k, v in sd.items():
+                nk = k
                 if not k.startswith("text_model.") and "text_model." + k in model_keys:
-                    new_key = "text_model." + k
-                elif k.startswith("cond_stage_model.transformer."):
-                    suffix = k.replace("cond_stage_model.transformer.", "")
-                    new_key = suffix if suffix in model_keys else ("text_model." + suffix)
+                    nk = "text_model." + k
                 elif k.startswith("transformer."):
-                    suffix = k.replace("transformer.", "")
-                    new_key = suffix if suffix in model_keys else ("text_model." + suffix)
-                new_sd[new_key] = v
+                    sfx = k.replace("transformer.", "")
+                    nk = sfx if sfx in model_keys else "text_model." + sfx
+                new_sd[nk] = v
             model.load_state_dict(new_sd, strict=False)
 
-        load_text_encoder_state_dict(text_encoder, clip_state_dict)
+        _load_clip(text_encoder, clip_state_dict)
         text_encoder = text_encoder.to(device=self.device, dtype=torch.bfloat16)
         del clip_state_dict
         gc.collect()
-        print("CLIP text encoder loaded on GPU.")
+        print("CLIP text encoder loaded.")
 
-        # 2. T5 text encoder (~4.9GB) on CPU, quantised to FP8 to save RAM.
+        # ── 2. T5 text encoder (~4.9 GB, FP8 on CPU) ─────────────────────────
         print("Loading T5 text encoder...")
-        t5_config = T5Config.from_pretrained(base_model_path, subfolder="text_encoder_2", token=False)
+        t5_config = T5Config.from_pretrained(
+            base_model_path, subfolder="text_encoder_2", token=False
+        )
         text_encoder_2 = T5EncoderModel(t5_config).to(device="cpu", dtype=torch.bfloat16)
-        t5_path = os.path.join(current_dir, "models", "v2_ckpt", "split_files", "text_encoders", "t5xxl_fp8_e4m3fn_scaled.safetensors")
+        t5_path = os.path.join(
+            current_dir, "models", "v2_ckpt", "split_files",
+            "text_encoders", "t5xxl_fp8_e4m3fn_scaled.safetensors"
+        )
         t5_state_dict = load_file(t5_path)
 
-        def load_t5_state_dict(model, state_dict):
+        def _load_t5(model, sd):
             model_keys = set(model.state_dict().keys())
             new_sd = {}
-            for k, v in state_dict.items():
+            for k, v in sd.items():
                 if v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
                     v = v.to(torch.bfloat16)
-                new_key = k
+                nk = k
                 if not k.startswith("encoder.") and "encoder." + k in model_keys:
-                    new_key = "encoder." + k
-                elif k.startswith("cond_stage_model.transformer."):
-                    suffix = k.replace("cond_stage_model.transformer.", "")
-                    new_key = suffix if suffix in model_keys else ("encoder." + suffix)
+                    nk = "encoder." + k
                 elif k.startswith("transformer."):
-                    suffix = k.replace("transformer.", "")
-                    new_key = suffix if suffix in model_keys else ("encoder." + suffix)
-                new_sd[new_key] = v
+                    sfx = k.replace("transformer.", "")
+                    nk = sfx if sfx in model_keys else "encoder." + sfx
+                new_sd[nk] = v
             model.load_state_dict(new_sd, strict=False)
 
-        load_t5_state_dict(text_encoder_2, t5_state_dict)
+        _load_t5(text_encoder_2, t5_state_dict)
         del t5_state_dict
         gc.collect()
         quantize(text_encoder_2, weights=qfloat8)
@@ -207,20 +201,25 @@ class KontextEditModel():
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        print("T5 text encoder loaded (FP8) on CPU.")
+        print("T5 text encoder loaded (FP8, CPU).")
 
-        # 3. VAE (~335MB). Loaded on CPU; the pipeline moves it to GPU only for
-        #    encode/decode and back, to keep VRAM free during denoising.
-        vae_path = os.path.join(current_dir, "models", "v2_ckpt", "split_files", "vae", "ae.safetensors")
+        # ── 3. VAE (~335 MB, CPU-offloaded) ───────────────────────────────────
+        vae_path = os.path.join(
+            current_dir, "models", "v2_ckpt", "split_files", "vae", "ae.safetensors"
+        )
         vae = AutoencoderKL.from_single_file(
-            vae_path, config=base_model_path, subfolder="vae", torch_dtype=torch.bfloat16, token=False
+            vae_path,
+            config=base_model_path,
+            subfolder="vae",
+            torch_dtype=torch.bfloat16,
+            token=False,
         ).to(device="cpu", dtype=torch.bfloat16)
-        print("VAE loaded on CPU (offloaded between encode/decode).")
+        print("VAE loaded (CPU offloaded).")
 
-        # 4. GGUF transformer (~8.4GB) on GPU, loaded into the custom class so the
-        #    EasyControl attention processors work.
+        # ── 4. Flux Kontext GGUF transformer (~8.4 GB, GPU) ───────────────────
         transformer_path = os.path.join(
-            current_dir, "models", "v2_ckpt", "split_files", "diffusion_models", "flux1-kontext-dev-Q5_K_M.gguf"
+            current_dir, "models", "v2_ckpt", "split_files",
+            "diffusion_models", "flux1-kontext-dev-Q5_K_M.gguf"
         )
         print(f"Loading GGUF transformer from: {transformer_path}")
         transformer = FluxTransformer2DModel.from_single_file(
@@ -232,8 +231,7 @@ class KontextEditModel():
         ).to(device)
         print("GGUF transformer loaded on GPU.")
 
-        # 5. Assemble the EasyControl pipeline from the components above
-        #    (scheduler + tokenizers come from the base repo).
+        # ── 5. Assemble pipeline (scheduler + tokenizers from HF config only) ─
         self.pipe = FluxKontextControlPipeline.from_pretrained(
             base_model_path,
             transformer=transformer,
@@ -248,21 +246,15 @@ class KontextEditModel():
         try:
             self.pipe.vae.enable_tiling()
         except Exception as e:
-            print(f"Failed to enable VAE tiling: {e}")
+            print(f"VAE tiling unavailable: {e}")
 
-        # Cap the working resolution so the ~1MP Kontext double-sequence + GGUF
-        # transformer fit in ~12GB VRAM (otherwise Windows spills into shared RAM
-        # over PCIe -> hundreds of seconds per step). Override with the
-        # MAGICQUILL_MAX_SIDE env var (e.g. 768 for tighter VRAM, 1280 for more).
+        # Clamp working resolution to keep within VRAM budget.
         self.pipe.max_working_side = int(os.environ.get("MAGICQUILL_MAX_SIDE", "1024"))
         print(f"[Speed] max_working_side = {self.pipe.max_working_side} px")
 
-        # Smaller control condition -> fewer cached cond tokens (less VRAM), still
-        # enough to steer the brush. Override with MAGICQUILL_COND_SIZE.
         cond_size = int(os.environ.get("MAGICQUILL_COND_SIZE", "256"))
 
-        # 6. EasyControl task LoRAs — this is what makes brush + prompt edits
-        #    actually follow the strokes.
+        # ── 6. EasyControl task LoRAs ─────────────────────────────────────────
         control_lora_config = {
             "local":   {"path": os.path.join(easycontrol_base_dir, "local_lora.safetensors"),   "lora_weights": [1.0], "cond_size": cond_size},
             "removal": {"path": os.path.join(easycontrol_base_dir, "removal_lora.safetensors"), "lora_weights": [1.0], "cond_size": cond_size},
@@ -272,12 +264,12 @@ class KontextEditModel():
         self.pipe.load_control_loras(control_lora_config)
         print("[OK] EasyControl task LoRAs loaded.")
 
-        # 7. Aux puzzle LoRA for foreground mode (PEFT adapter, optional).
+        # ── 7. Aux puzzle LoRA (optional) ─────────────────────────────────────
         self.aux_lora_weight_name = aux_lora_weight_name
-        self.aux_lora_dir = aux_lora_dir
-        self.aux_lora_weight = aux_lora_weight
-        self.aux_adapter_name = "aux"
-        self._aux_lora_available = False
+        self.aux_lora_dir         = aux_lora_dir
+        self.aux_lora_weight      = aux_lora_weight
+        self.aux_adapter_name     = "aux"
+        self._aux_lora_available  = False
         aux_path = os.path.join(self.aux_lora_dir, self.aux_lora_weight_name)
         if os.path.isfile(aux_path):
             try:
@@ -286,154 +278,182 @@ class KontextEditModel():
                 self._disable_aux_lora()
                 print(f"Loaded aux LoRA: {aux_path}")
             except Exception as e:
-                print(f"[WARN] Could not load aux LoRA ({e}); foreground mode will run without it.")
+                print(f"[WARN] Could not load aux LoRA ({e}); foreground mode runs without it.")
         else:
-            print(f"Aux LoRA not found at {aux_path}, foreground mode will run without it.")
+            print(f"Aux LoRA not found at {aux_path}, foreground mode runs without it.")
+
+    # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _tensor_to_pil(self, tensor_image):
-        return Image.fromarray(np.clip(255. * tensor_image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
+        return Image.fromarray(
+            np.clip(255. * tensor_image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8)
+        )
 
     def _pil_to_tensor(self, pil_image):
         return torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0).unsqueeze(0)
 
-    def _debug_dump(self, name, tensor):
-        if not os.environ.get("MAGICQUILL_DEBUG_MASKS"):
-            return
-        try:
-            out_dir = os.environ.get("MAGICQUILL_DEBUG_DIR", "debug_masks")
-            os.makedirs(out_dir, exist_ok=True)
-            arr = tensor.detach().float().cpu().numpy()
-            arr = np.squeeze(arr)
-            if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
-                arr = np.transpose(arr, (1, 2, 0))
-            arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-            Image.fromarray(arr).save(os.path.join(out_dir, f"{name}.png"))
-            lo, hi = float(tensor.min()), float(tensor.max())
-            frac_lt = float((tensor < 0.5).float().mean())
-            print(f"[DEBUG] dumped {name}: shape={tuple(tensor.shape)} min={lo:.3f} max={hi:.3f} fraction(<0.5)={frac_lt:.3f}")
-        except Exception as e:
-            print(f"[DEBUG] failed to dump {name}: {e}")
+    def _ensure_channels_last(self, tensor, name="tensor"):
+        """Ensure tensor is [H, W, C] for blending math."""
+        t = tensor.squeeze(0) if tensor.ndim == 4 else tensor
+        if t.ndim == 3 and t.shape[0] in (1, 3, 4) and t.shape[-1] not in (1, 3, 4):
+            t = t.permute(1, 2, 0)
+        return t
 
-    def _ensure_channels_last(self, image_tensor: torch.Tensor, name: str = "image") -> torch.Tensor:
-        if image_tensor.ndim != 4:
-            raise ValueError(f"{name} must be 4D, got shape {tuple(image_tensor.shape)}")
-        if image_tensor.shape[-1] in [1, 3, 4]:
-            return image_tensor
-        if image_tensor.shape[1] in [1, 3, 4]:
-            return image_tensor.permute(0, 2, 3, 1).contiguous()
-        raise ValueError(f"{name} has unsupported channel layout: {tuple(image_tensor.shape)}")
+    def _expand_mask(self, mask, expand=10):
+        """Morphologically dilate a single-channel active-high mask."""
+        if expand > 0:
+            mask = self.mask_processor.expand_mask({"mask": mask.unsqueeze(0)}, expand, tapered_corners=True)["mask"].squeeze(0)
+        return mask.clamp(0.0, 1.0)
 
-    def _mask_to_blend_tensor(self, mask_tensor: torch.Tensor, blur: bool = True) -> torch.Tensor:
-        mask = mask_tensor.detach().float()
-        if mask.ndim == 4:
-            mask = mask[0, 0] if mask.shape[1] == 1 else mask[0].max(dim=0).values
-        elif mask.ndim == 3:
-            mask = mask[0]
-        mask_np = (mask.clamp(0.0, 1.0).cpu().numpy() * 255).astype(np.uint8)
-        if blur:
-            mask_np = cv2.GaussianBlur(mask_np, (11, 11), 3.0)
-        return torch.from_numpy(mask_np / 255.0).float().unsqueeze(0).unsqueeze(-1)
+    def _apply_black_mask(self, image, mask):
+        """Zero-out pixels where mask > 0.5; return PIL."""
+        img = self._ensure_channels_last(image.clone(), "image")
+        m   = mask.squeeze().unsqueeze(-1) if mask.ndim < 3 else mask.squeeze(0).permute(1, 2, 0) if mask.shape[0] == 1 else mask
+        blacked = img * (1.0 - m.clamp(0, 1))
+        return self._tensor_to_pil(blacked.unsqueeze(0).permute(0, 3, 1, 2) if blacked.ndim == 3 else blacked)
 
-    def _composite_preserve_mask(self, final_image, original_image, preserve_mask, label="regions"):
-        if preserve_mask is None:
-            return final_image
-        if torch.sum(preserve_mask > 0.5).item() == 0:
-            return final_image
-        try:
-            blend = self._mask_to_blend_tensor(preserve_mask)
-            original_blend = self._ensure_channels_last(original_image, "original_image")
-            final_image = self._ensure_channels_last(final_image, "final_image")
-            return final_image * (1.0 - blend) + original_blend * blend
-        except Exception as e:
-            print(f"[WARN] Preserve composite failed ({label}): {e}")
-            return final_image
+    def _composite_preserve_mask(self, generated, original, preserve_mask, label="region"):
+        """Paste original pixels back wherever preserve_mask > 0.5."""
+        gen  = self._ensure_channels_last(generated, "generated")
+        orig = self._ensure_channels_last(original,  "original")
+        m    = preserve_mask.squeeze()
+        if m.ndim == 3:
+            m = m[0]
+        m = m.unsqueeze(-1).to(gen.device)
+        blended = gen * (1.0 - m) + orig * m
+        print(f"[OK] Preserved {label} ({int(m.sum().item())} px)")
+        return blended
+
+    def _enable_aux_lora(self):
+        if self._aux_lora_available:
+            self.pipe.set_adapters([self.aux_adapter_name], adapter_weights=[self.aux_lora_weight])
+
+    def _disable_aux_lora(self):
+        if self._aux_lora_available:
+            self.pipe.disable_adapters()
 
     def clear_cache(self):
-        for name, attn_processor in self.pipe.transformer.attn_processors.items():
-            if hasattr(attn_processor, 'bank_kv'):
-                attn_processor.bank_kv.clear()
-            if hasattr(attn_processor, 'bank_attn'):
-                attn_processor.bank_attn = None
         import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _enable_aux_lora(self):
-        if not self._aux_lora_available:
-            print("[Foreground] aux LoRA unavailable; running without it.")
-            return
-        self.pipe.enable_lora()
-        self.pipe.set_adapters([self.aux_adapter_name], adapter_weights=[self.aux_lora_weight])
-        print(f"Enabled aux LoRA '{self.aux_adapter_name}' with weight {self.aux_lora_weight}")
+    # ── Editing methods ────────────────────────────────────────────────────────
 
-    def _disable_aux_lora(self):
-        if not self._aux_lora_available:
-            return
-        self.pipe.disable_lora()
-        print("Disabled aux LoRA")
+    def local_edit(self,
+                   image, positive_prompt, fill_mask, local_strength,
+                   seed, steps, cfg, preserve_mask=None):
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        original_image_tensor = image.clone()
+        # Hard cap: local fill paths must never exceed 18 steps.
+        steps = min(steps, 18)
 
-    def _expand_mask(self, mask_tensor: torch.Tensor, expand: int = 0) -> torch.Tensor:
-        if expand <= 0:
-            return mask_tensor
-        expanded = self.mask_processor.expand_mask(mask_tensor, expand=expand, tapered_corners=True)[0]
-        return expanded
+        fill_active = to_active_high_mask(fill_mask)
+        has_fill_stroke = torch.sum(fill_active > 0.5).item() > 0
+        if has_fill_stroke:
+            steps = 18
 
-    def _tensor_mask_to_pil3(self, mask_tensor: torch.Tensor) -> Image.Image:
-        mask_01 = torch.clamp(mask_tensor, 0.0, 1.0)
-        if mask_01.ndim == 3 and mask_01.shape[-1] == 3:
-            mask_01 = mask_01[..., 0]
-        if mask_01.ndim == 3 and mask_01.shape[0] == 1:
-            mask_01 = mask_01[0]
-        pil = self._tensor_to_pil(mask_01.unsqueeze(-1).repeat(1, 1, 3))
-        return pil
+        original_mask = self._expand_mask(fill_active, expand=10)
+        generation_mask = original_mask.clone()
 
-    def _apply_black_mask(self, image_tensor: torch.Tensor, binary_mask: torch.Tensor) -> Image.Image:
-        if binary_mask.ndim == 3:
-            binary_mask = binary_mask[0]
-        mask_bool = (binary_mask > 0.5)
-        img = image_tensor.clone()
-        img[0][mask_bool] = 0.0
-        return self._tensor_to_pil(img)
+        img = image.clone()
+
+        # Alpha-composite guard: strip any RGBA transparency before VAE encoding.
+        if img.shape[0] == 4:
+            alpha_ch = img[3:4].clamp(0.0, 1.0)
+            img = img[:3] * alpha_ch + original_image_tensor[:3] * (1.0 - alpha_ch)
+        elif img.shape[-1] == 4:
+            alpha_ch = img[..., 3:4].clamp(0.0, 1.0)
+            img = img[..., :3] * alpha_ch + original_image_tensor[..., :3] * (1.0 - alpha_ch)
+
+        # Seed the fill region with Gaussian noise so Flux flow-matching
+        # generates new content (flat white is treated as a preserve boundary).
+        fill_hi = fill_active.squeeze(0) if fill_active.ndim == 3 else fill_active
+        brush_mask_3 = (fill_hi > 0.5).unsqueeze(0).expand(img.shape[0], -1, -1)
+        noise_pixels = torch.randn_like(img, generator=torch.Generator(device=img.device).manual_seed(seed))
+        img = torch.where(brush_mask_3, noise_pixels, img)
+        image_pil = self._tensor_to_pil(img)
+
+        bg_mask   = 1.0 - original_mask
+        spatial_pil = self._apply_black_mask(image, bg_mask)
+
+        control_dict = {
+            "type": "local",
+            "spatial_images": [spatial_pil],
+            "gammas": [local_strength],
+        }
+        result_pil = self.pipe(
+            prompt=positive_prompt,
+            image=image_pil,
+            mask_image=generation_mask,
+            height=self.pipe.fit_kontext_resolution(image_pil)[1],
+            width=self.pipe.fit_kontext_resolution(image_pil)[0],
+            guidance_scale=cfg,
+            num_inference_steps=steps,
+            generator=generator,
+            max_sequence_length=512,
+            control_dict=control_dict,
+        ).images[0]
+        self.clear_cache()
+        final_image = self._pil_to_tensor(result_pil)
+
+        # Smooth-blend back into original along mask border.
+        try:
+            mask_np = np.array(self._tensor_to_pil(original_mask))
+            if mask_np.ndim == 3:
+                mask_np = mask_np[:, :, 0]
+            blurred = cv2.GaussianBlur(mask_np, (11, 11), 3.0)
+            blend_w = torch.from_numpy(blurred / 255.0).float().unsqueeze(0).unsqueeze(-1)
+            orig_cl = self._ensure_channels_last(original_image_tensor, "original")
+            final_image = final_image * blend_w + orig_cl * (1.0 - blend_w)
+            print("[OK] Local edit with smooth blending")
+        except Exception as e:
+            print(f"[WARN] Smooth blending failed ({e}), using raw result")
+
+        if preserve_mask is not None:
+            final_image = self._composite_preserve_mask(
+                final_image, original_image_tensor, preserve_mask, "preserved zone"
+            )
+        return (final_image, self._tensor_to_pil(spatial_pil), original_mask)
 
     def edge_edit(self,
-                image, colored_image, positive_prompt,
-                base_mask, add_mask, remove_mask,
-                fine_edge,
-                edge_strength, color_strength,
-                seed, steps, cfg):
+                  image, colored_image, positive_prompt,
+                  base_mask, add_mask, remove_mask,
+                  fine_edge,
+                  edge_strength, color_strength,
+                  seed, steps, cfg):
         generator = torch.Generator(device=self.device).manual_seed(seed)
-
         original_image_tensor = image.clone()
-        
-        add_active = to_active_high_mask(add_mask)
+
+        add_active    = to_active_high_mask(add_mask)
         remove_active = to_active_high_mask(remove_mask)
-        base_active = to_active_high_mask(base_mask)
-        
-        has_add_stroke = torch.sum(add_active).item() > 0
+        base_active   = to_active_high_mask(base_mask)
+
+        has_add_stroke    = torch.sum(add_active).item() > 0
         has_remove_stroke = torch.sum(remove_active).item() > 0
-        
+
         if has_add_stroke or has_remove_stroke:
-            brush_only = torch.clamp(add_active + remove_active, 0.0, 1.0)
-            original_mask = self._expand_mask(brush_only, expand=25)
-            matted_only = torch.clamp(base_active - brush_only, 0.0, 1.0)
+            brush_only         = torch.clamp(add_active + remove_active, 0.0, 1.0)
+            original_mask      = self._expand_mask(brush_only, expand=25)
+            matted_only        = torch.clamp(base_active - brush_only, 0.0, 1.0)
             matted_object_mask = self._expand_mask(matted_only, expand=10)
         else:
-            original_mask = self._expand_mask(base_active, expand=25)
+            original_mask      = self._expand_mask(base_active, expand=25)
             matted_object_mask = self._expand_mask(base_active, expand=10)
 
-        image_pil = self._tensor_to_pil(image)
-        control_dict = {}
+        image_pil     = self._tensor_to_pil(image)
+        control_dict  = {}
         lineart_output = None
 
         color_delta = (image - colored_image).abs().max().item() if image.shape == colored_image.shape else 1.0
         use_color_control = color_delta > 1e-3 and not torch.equal(image, colored_image)
+
         if use_color_control:
             print("Apply color control")
             colored_image_pil = self._tensor_to_pil(colored_image)
-            color_image_np = np.array(colored_image_pil)
+            color_image_np    = np.array(colored_image_pil)
             downsampled = cv2.resize(color_image_np, (32, 32), interpolation=cv2.INTER_AREA)
-            upsampled = cv2.resize(downsampled, (256, 256), interpolation=cv2.INTER_NEAREST)
+            upsampled   = cv2.resize(downsampled, (256, 256), interpolation=cv2.INTER_NEAREST)
             color_block = Image.fromarray(upsampled)
             control_dict = {
                 "type": "color",
@@ -443,22 +463,25 @@ class KontextEditModel():
         else:
             print("Apply edge control")
             if fine_edge == "enable":
-                lineart_image = self.lineart_processor(np.array(self._tensor_to_pil(image.cpu().squeeze())), detect_resolution=1024, style="contour", output_type="pil")
+                lineart_image  = self.lineart_processor(
+                    np.array(self._tensor_to_pil(image.cpu().squeeze())),
+                    detect_resolution=1024, style="contour", output_type="pil"
+                )
                 lineart_output = self._pil_to_tensor(lineart_image)
             else:
-                scribble_image = self.scribble_processor(np.array(self._tensor_to_pil(image.cpu().squeeze())), safe=True, resolution=512, output_type="pil")
+                scribble_image = self.scribble_processor(
+                    np.array(self._tensor_to_pil(image.cpu().squeeze())),
+                    safe=True, resolution=512, output_type="pil"
+                )
                 lineart_output = self._pil_to_tensor(scribble_image)
 
             if lineart_output is None:
                 raise ValueError("Preprocessor failed to generate lineart.")
 
-            # Map the active-high strokes back to the lineart conditioning image correctly
-            add_mask_resized = F.interpolate(add_active.unsqueeze(0).float(), size=(lineart_output.shape[1], lineart_output.shape[2]), mode='nearest').squeeze(0)
+            add_mask_resized    = F.interpolate(add_active.unsqueeze(0).float(),    size=(lineart_output.shape[1], lineart_output.shape[2]), mode='nearest').squeeze(0)
             remove_mask_resized = F.interpolate(remove_active.unsqueeze(0).float(), size=(lineart_output.shape[1], lineart_output.shape[2]), mode='nearest').squeeze(0)
-            bool_add_stroke = (add_mask_resized > 0.5)
-            bool_remove_stroke = (remove_mask_resized > 0.5)
-            lineart_output[bool_remove_stroke] = 0.0
-            lineart_output[bool_add_stroke] = 1.0
+            lineart_output[remove_mask_resized > 0.5] = 0.0
+            lineart_output[add_mask_resized    > 0.5] = 1.0
 
             control_dict = {
                 "type": "edge",
@@ -467,7 +490,10 @@ class KontextEditModel():
             }
 
         colored_image_np = np.array(self._tensor_to_pil(colored_image))
-        debug_image = lineart_output if lineart_output is not None else self.color_processor(colored_image_np, detect_resolution=1024, output_type="pil")
+        debug_image = (
+            lineart_output if lineart_output is not None
+            else self.color_processor(colored_image_np, detect_resolution=1024, output_type="pil")
+        )
 
         result_pil = self.pipe(
             prompt=positive_prompt,
@@ -484,13 +510,13 @@ class KontextEditModel():
         self.clear_cache()
 
         final_image = self._pil_to_tensor(result_pil)
-        
+
         if matted_object_mask is not None and torch.sum(matted_object_mask > 0.5).item() > 0:
             final_image = self._composite_preserve_mask(
                 final_image, original_image_tensor, matted_object_mask, "matted objects"
             )
             print("[OK] Matted objects preserved with smooth blending")
-        
+
         return (final_image, debug_image, original_mask)
 
     def object_removal(self,
@@ -499,12 +525,11 @@ class KontextEditModel():
                        local_strength,
                        seed, steps, cfg):
         generator = torch.Generator(device=self.device).manual_seed(seed)
-
         original_image_tensor = image.clone()
-        remove_active = to_active_high_mask(remove_mask)
-        original_mask = self._expand_mask(remove_active, expand=10)
+        remove_active  = to_active_high_mask(remove_mask)
+        original_mask  = self._expand_mask(remove_active, expand=10)
 
-        image_pil = self._tensor_to_pil(image)
+        image_pil   = self._tensor_to_pil(image)
         spatial_pil = self._apply_black_mask(image, original_mask)
         control_dict = {
             "type": "removal",
@@ -527,110 +552,20 @@ class KontextEditModel():
         self.clear_cache()
 
         final_image = self._pil_to_tensor(result_pil)
-        
+
         try:
-            original_mask_pil = self._tensor_to_pil(original_mask)
-            original_mask_np = np.array(original_mask_pil)
-            if original_mask_np.ndim == 3:
-                original_mask_np = original_mask_np[:, :, 0]
-            blurred_mask = cv2.GaussianBlur(original_mask_np, (11, 11), 3.0)
-            blend_mask_smooth = torch.from_numpy(blurred_mask / 255.0).float().unsqueeze(0).unsqueeze(-1)
-            original_blend = self._ensure_channels_last(original_image_tensor, "original_image_tensor")
-            final_image = final_image * blend_mask_smooth + original_blend * (1.0 - blend_mask_smooth)
+            mask_np = np.array(self._tensor_to_pil(original_mask))
+            if mask_np.ndim == 3:
+                mask_np = mask_np[:, :, 0]
+            blurred = cv2.GaussianBlur(mask_np, (11, 11), 3.0)
+            blend_w = torch.from_numpy(blurred / 255.0).float().unsqueeze(0).unsqueeze(-1)
+            orig_cl = self._ensure_channels_last(original_image_tensor, "original")
+            final_image = final_image * blend_w + orig_cl * (1.0 - blend_w)
             print("[OK] Object removal with smooth blending")
         except Exception as e:
-            print(f"[WARN] Smooth blending failed ({e}), using generated result directly")
-        
-        return (final_image, self._pil_to_tensor(spatial_pil), original_mask)
+            print(f"[WARN] Smooth blending failed ({e}), using raw result")
 
-    def local_edit(self,
-                   image, positive_prompt, fill_mask, local_strength,
-                   seed, steps, cfg, preserve_mask=None):
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        original_image_tensor = image.clone()
-        # Safety clamp: local_edit must never run more than 18 steps
-        # (the fill-brush path locks to 18 below, but this catches direct calls)
-        steps = min(steps, 18)
-        
-        fill_active = to_active_high_mask(fill_mask)
-        has_fill_stroke = torch.sum(fill_active > 0.5).item() > 0
-        
-        if has_fill_stroke:
-            steps = 18  # Lock step execution counter down
-            
-        original_mask = self._expand_mask(fill_active, expand=10)
-        
-        # VERY IMPORTANT: Ensure mask matches pipeline active-high layout convention
-        generation_mask = original_mask.clone()
-        
-        # Replace whiteout with Gaussian noise: Flux Kontext flow-matching treats
-        # flat white latents as a boundary condition to PRESERVE, not overwrite.
-        # Seeding the brushed region with random noise forces the model to generate.
-        img = image.clone()
-
-        # ── Alpha-composite guard ──────────────────────────────────────────────
-        # When a prop sticker was pasted, the canvas tensor may still carry RGBA
-        # data (4 channels) or have zero-valued pixels where the transparency
-        # checkerboard sat. Composite those pixels against the background NOW,
-        # before noise-seeding, so the VAE never sees raw transparency values.
-        if img.shape[0] == 4:  # RGBA canvas
-            alpha_ch = img[3:4].clamp(0.0, 1.0)
-            img = img[:3] * alpha_ch + original_image_tensor[:3] * (1.0 - alpha_ch)
-        elif img.shape[-1] == 4:  # channels-last RGBA
-            alpha_ch = img[..., 3:4].clamp(0.0, 1.0)
-            img = img[..., :3] * alpha_ch + original_image_tensor[..., :3] * (1.0 - alpha_ch)
-        # ──────────────────────────────────────────────────────────────────────
-
-        fill_hi = fill_active.squeeze(0) if fill_active.ndim == 3 else fill_active
-        brush_mask_3 = (fill_hi > 0.5).unsqueeze(0).expand(img.shape[0], -1, -1)
-        noise_pixels = torch.randn_like(img, generator=torch.Generator(device=img.device).manual_seed(seed))
-        img = torch.where(brush_mask_3, noise_pixels, img)
-        image_pil = self._tensor_to_pil(img)
-        
-        # local LoRA conditioning: blackout background, keep stroke area intact
-        bg_mask = 1.0 - original_mask
-        spatial_pil = self._apply_black_mask(image, bg_mask)
-        
-        control_dict = {
-            "type": "local",
-            "spatial_images": [spatial_pil],
-            "gammas": [local_strength],
-        }
-        result_pil = self.pipe(
-            prompt=positive_prompt,
-            image=image_pil,
-            mask_image=generation_mask,
-            height=self.pipe.fit_kontext_resolution(image_pil)[1],
-            width=self.pipe.fit_kontext_resolution(image_pil)[0],
-            guidance_scale=cfg,
-            num_inference_steps=steps, # This is safely set to 18 above
-            generator=generator,
-            max_sequence_length=512,
-            control_dict=control_dict,
-        ).images[0]
-        self.clear_cache()
-        final_image = self._pil_to_tensor(result_pil)
-        
-        try:
-            original_mask_pil = self._tensor_to_pil(original_mask)
-            original_mask_np = np.array(original_mask_pil)
-            if original_mask_np.ndim == 3:
-                original_mask_np = original_mask_np[:, :, 0]
-            blurred_mask = cv2.GaussianBlur(original_mask_np, (11, 11), 3.0)
-            blend_mask_smooth = torch.from_numpy(blurred_mask / 255.0).float().unsqueeze(0).unsqueeze(-1)
-            original_blend = self._ensure_channels_last(original_image_tensor, "original_image_tensor")
-            final_image = final_image * blend_mask_smooth + original_blend * (1.0 - blend_mask_smooth)
-            print("[OK] Local edit with smooth blending")
-        except Exception as e:
-            print(f"[WARN] Smooth blending failed ({e}), using generated result directly")
-        if preserve_mask is not None:
-            final_image = self._composite_preserve_mask(
-                final_image, original_image_tensor, preserve_mask, "matted objects"
-            )
-        
-        return (final_image, self._pil_to_tensor(spatial_pil), original_mask)
-
-
+        return (final_image, self._tensor_to_pil(spatial_pil), original_mask)
 
     def kontext_edit(self,
                      image, positive_prompt,
@@ -652,46 +587,40 @@ class KontextEditModel():
         self.clear_cache()
 
         final_image = self._pil_to_tensor(result_pil)
-        mask = torch.zeros((1, final_image.shape[1], final_image.shape[2]), dtype=torch.float32, device=final_image.device)
+        mask = torch.zeros(
+            (1, final_image.shape[1], final_image.shape[2]),
+            dtype=torch.float32, device=final_image.device
+        )
         return (final_image, image, mask)
 
     def process(self, image, colored_image,
-                 merged_image, positive_prompt,
+                merged_image, positive_prompt,
                 total_mask, add_mask, remove_mask, add_prop_mask, fill_mask,
                 fine_edge, fix_perspective, edge_strength, color_strength, local_strength, grow_size,
                 seed, steps, cfg, flag="precise_edit"):
-        # Hard cap: fill/foreground brush paths must never exceed 18 inference steps.
+
         if flag in ("foreground", "local"):
             steps = min(steps, 18)
-            # Build the combined fill mask.
-            # For "foreground" (prop sticker + fill strokes), use total_mask as the
-            # generation target — it marks everything the frontend painted, including
-            # the transparent (checkerboard) zone under the prop.
-            # Use merged_image (prop composited over background) so the VAE receives
-            # clean pixels — not raw transparency channels.
+
             if flag == "foreground":
-                # Use the user's fill brush strokes as the generation target.
-                # total_mask covers the ENTIRE prop bounding box (body + hole) which
-                # causes local_edit to mask the whole scene → black silhouette output.
-                # fill_mask targets only the pixels the user explicitly brushed,
-                # which is exactly the transparent / checkerboard area to fill.
+                # Use fill_mask (user's actual brush strokes) as the generation
+                # target. total_mask covers the whole prop bounding box and causes
+                # local_edit to black-out the entire prop zone.
+                # Fall back to total_mask only when no fill strokes are present.
                 fill_active_check = to_active_high_mask(fill_mask)
-                fill_has_pixels = torch.sum(fill_active_check > 0.5).item() > 0
+                fill_has_pixels   = torch.sum(fill_active_check > 0.5).item() > 0
                 if fill_has_pixels:
                     effective_fill_mask = fill_mask
-                    print(f"[ROUTING] foreground → local_edit | fill_mask ({int(torch.sum(fill_active_check>0.5).item())} px), merged canvas")
+                    print(f"[ROUTING] foreground -> local_edit | fill_mask ({int(torch.sum(fill_active_check>0.5).item())} px), merged canvas")
                 else:
-                    # No fill strokes — prop-only paste; use total_mask so the
-                    # transparent checkerboard zone gets noise-seeded.
                     effective_fill_mask = total_mask
-                    print(f"[ROUTING] foreground → local_edit | total_mask (no fill strokes), merged canvas")
-                canvas_image = merged_image   # clean, alpha-composited canvas
+                    print(f"[ROUTING] foreground -> local_edit | total_mask (no fill strokes), merged canvas")
+                canvas_image = merged_image
             else:
                 effective_fill_mask = fill_mask
-                canvas_image = image
-                print(f"[ROUTING] local → local_edit | fill_mask, original image")
+                canvas_image        = image
+                print(f"[ROUTING] local -> local_edit | fill_mask, original image")
 
-            # Diagnostic: confirm the effective mask has live pixels.
             fill_active_check2 = to_active_high_mask(effective_fill_mask)
             print(f"[DIAGNOSTIC] effective_fill_mask sum: {torch.sum(fill_active_check2 > 0.5).item()}")
 
@@ -700,8 +629,11 @@ class KontextEditModel():
                 seed, steps, cfg,
                 preserve_mask=None,
             )
+
         elif flag == "removal":
-            return self.object_removal(image, positive_prompt, remove_mask, local_strength, seed, steps, cfg)
+            return self.object_removal(
+                image, positive_prompt, remove_mask, local_strength, seed, steps, cfg
+            )
         elif flag == "precise_edit":
             return self.edge_edit(
                 image, colored_image, positive_prompt,
@@ -713,25 +645,27 @@ class KontextEditModel():
         elif flag == "kontext":
             return self.kontext_edit(image, positive_prompt, seed, steps, cfg)
         else:
-            raise ValueError("Invalid Editing Type: {}".format(flag))
+            raise ValueError(f"Invalid Editing Type: {flag}")
 
+
+# ── SAM (Segment Anything) ─────────────────────────────────────────────────────
 
 class SAM():
     def __init__(self):
-        self.join_alpha = JoinImageWithAlpha()
+        self.join_alpha  = JoinImageWithAlpha()
         self.invert_mask = InvertMask()
-        self.predictor = None
+        self.predictor   = None
         self.load_model()
 
     def load_model(self, model_type='vit_b', checkpoint_path=None, device='cpu'):
         if checkpoint_path is None:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            checkpoint_path = os.path.join(current_dir, 'models', 'sam', 'sam_vit_b_01ec64.pth')
-            
+            checkpoint_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'models', 'sam', 'sam_vit_b_01ec64.pth'
+            )
         if not os.path.exists(checkpoint_path):
-            print(f"Warning: SAM Checkpoint not found at {checkpoint_path}. Please download it.")
+            print(f"Warning: SAM checkpoint not found at {checkpoint_path}.")
             return
-            
         print(f"Loading SAM model: {model_type} from {checkpoint_path}")
         self.sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
         self.sam.to(device=device)
@@ -740,25 +674,26 @@ class SAM():
     def morphological_operations(self, mask, kernel_size=11, iterations=1):
         mask_for_open_close = mask.clone()
         mask_for_close_open = mask.clone()
-        
-        for i in range(iterations):
-            eroded = -F.max_pool2d(-mask_for_open_close, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            opened = F.max_pool2d(eroded, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            dilated = F.max_pool2d(opened, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            open_then_close = -F.max_pool2d(-dilated, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            mask_for_open_close = open_then_close
-        
-        for i in range(iterations):
-            dilated = F.max_pool2d(mask_for_close_open, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            closed = -F.max_pool2d(-dilated, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            eroded = -F.max_pool2d(-closed, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            close_then_open = F.max_pool2d(eroded, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-            mask_for_close_open = close_then_open
-        
-        final_mask = torch.min(open_then_close, close_then_open)
-        return final_mask
 
-    def process(self, image, keep_model_loaded=True, coordinates_positive=None, coordinates_negative=None, individual_objects=False, bboxes=None, mask=None):
+        for _ in range(iterations):
+            eroded           = -F.max_pool2d(-mask_for_open_close, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            opened           = F.max_pool2d(eroded, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            dilated          = F.max_pool2d(opened, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            open_then_close  = -F.max_pool2d(-dilated, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            mask_for_open_close = open_then_close
+
+        for _ in range(iterations):
+            dilated          = F.max_pool2d(mask_for_close_open, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            closed           = -F.max_pool2d(-dilated, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            eroded           = -F.max_pool2d(-closed, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            close_then_open  = F.max_pool2d(eroded, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            mask_for_close_open = close_then_open
+
+        return torch.min(open_then_close, close_then_open)
+
+    def process(self, image, keep_model_loaded=True,
+                coordinates_positive=None, coordinates_negative=None,
+                individual_objects=False, bboxes=None, mask=None):
         if self.predictor is None:
             self.load_model()
             if self.predictor is None:
@@ -767,15 +702,14 @@ class SAM():
         image_np = (image.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
         self.predictor.set_image(image_np)
 
-        input_point = []
-        input_label = []
-        
+        input_point, input_label = [], []
+
         if coordinates_positive:
             coords = json.loads(coordinates_positive) if isinstance(coordinates_positive, str) else coordinates_positive
             for p in coords:
                 input_point.append([p['x'], p['y']])
                 input_label.append(1)
-                
+
         if coordinates_negative:
             coords = json.loads(coordinates_negative) if isinstance(coordinates_negative, str) else coordinates_negative
             for p in coords:
@@ -784,18 +718,15 @@ class SAM():
 
         input_box = None
         if bboxes:
-            box_list = []
-            for box in bboxes:
-                box_list.append(list(box))
-            if len(box_list) > 0:
+            box_list = [list(box) for box in bboxes]
+            if box_list:
                 input_box = np.array(box_list)
 
-        if len(input_point) > 0:
+        if input_point:
             input_point = np.array(input_point)
             input_label = np.array(input_label)
         else:
-            input_point = None
-            input_label = None
+            input_point = input_label = None
 
         masks, scores, logits = self.predictor.predict(
             point_coords=input_point,
@@ -803,11 +734,10 @@ class SAM():
             box=input_box,
             multimask_output=False,
         )
-        
-        mask_np = masks[0]
-        mask = torch.from_numpy(mask_np).float().unsqueeze(0)
-        
-        invert_mask = self.invert_mask.invert(mask)[0]
+
+        mask_np          = masks[0]
+        mask             = torch.from_numpy(mask_np).float().unsqueeze(0)
+        invert_mask      = self.invert_mask.invert(mask)[0]
         image_with_alpha = self.join_alpha.join_image_with_alpha(image, invert_mask)[0]
 
         return (image_with_alpha, mask)
